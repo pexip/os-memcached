@@ -1,0 +1,6 @@
+Tests: daemon client.pl
+Depends:
+ iproute2,
+ libtest-simple-perl,
+ memcached,
+Restrictions: needs-root, isolation-container

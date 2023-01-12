@@ -1,0 +1,35 @@
+From: Steve Langasek <steve.langasek@ubuntu.com>
+Date: Sat, 15 Jan 2022 10:04:58 +0000
+Subject: fix an error due to use of a possibly uninitialized variable
+
+Last-Update: 2021-12-08
+Forwarded: no
+
+gcc detects that this variable may be used without being initialized.  Just
+initialize it to fix the error.
+---
+ logger.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/logger.c b/logger.c
+index 79f4ed1..3f3ec3b 100644
+--- a/logger.c
++++ b/logger.c
+@@ -269,7 +269,7 @@ static int _logger_parse_extw(logentry *e, char *scratch) {
+ 
+ static int _logger_parse_cne(logentry *e, char *scratch) {
+     int total;
+-    unsigned short rport;
++    unsigned short rport = 0;
+     char rip[64];
+     struct logentry_conn_event *le = (struct logentry_conn_event *) e->data;
+     const char * const transport_map[] = { "local", "tcp", "udp" };
+@@ -286,7 +286,7 @@ static int _logger_parse_cne(logentry *e, char *scratch) {
+ 
+ static int _logger_parse_cce(logentry *e, char *scratch) {
+     int total;
+-    unsigned short rport;
++    unsigned short rport = 0;
+     char rip[64];
+     struct logentry_conn_event *le = (struct logentry_conn_event *) e->data;
+     const char * const transport_map[] = { "local", "tcp", "udp" };
