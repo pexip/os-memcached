@@ -1,0 +1,23 @@
+--- a/testapp.c
++++ b/testapp.c
+@@ -2320,8 +2320,6 @@
+     int ii = 0, num_cases = 0;
+ #ifdef TLS
+     if (getenv("SSL_TEST") != NULL) {
+-        SSLeay_add_ssl_algorithms();
+-        SSL_load_error_strings();
+         enable_ssl = true;
+     }
+ #endif
+--- a/memcached.c
++++ b/memcached.c
+@@ -5820,9 +5820,6 @@
+             fprintf(stderr, "ERROR: You cannot enable SSL without a TCP port.\n");
+             exit(EX_USAGE);
+         }
+-        // openssl init methods.
+-        SSL_load_error_strings();
+-        SSLeay_add_ssl_algorithms();
+         // Initiate the SSL context.
+         ssl_init();
+     }

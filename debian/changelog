@@ -1,6 +1,7 @@
 memcached (1.6.18-1pexip1) pexip; urgency=medium
 
   * Prepare Pexip packaging
+  * Remove use of deprecated OpenSSL 3 symbols
 
  -- Huw Jones <huw@pexip.com>  Mon, 13 Feb 2023 12:15:48 +0000
 
