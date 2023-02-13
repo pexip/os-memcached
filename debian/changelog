@@ -1,3 +1,9 @@
+memcached (1.6.18-1pexip1) pexip; urgency=medium
+
+  * Prepare Pexip packaging
+
+ -- Huw Jones <huw@pexip.com>  Mon, 13 Feb 2023 12:15:48 +0000
+
 memcached (1.6.18-1) unstable; urgency=medium
 
   * New upstream release. (Closes: #1028497)
