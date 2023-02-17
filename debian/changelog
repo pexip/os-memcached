@@ -1,3 +1,9 @@
+memcached (1.6.18-1pexip2) pexip; urgency=medium
+
+  * No-change version bump
+
+ -- Huw Jones <huw@pexip.com>  Fri, 17 Feb 2023 15:18:26 +0000
+
 memcached (1.6.18-1pexip1) pexip; urgency=medium
 
   * Prepare Pexip packaging
