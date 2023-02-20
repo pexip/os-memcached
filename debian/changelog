@@ -1,3 +1,9 @@
+memcached (1.6.18-1pexip3) pexip; urgency=medium
+
+  * config: listen on unix socket instead of TCP
+
+ -- Huw Jones <huw@pexip.com>  Mon, 20 Feb 2023 11:56:50 +0000
+
 memcached (1.6.18-1pexip2) pexip; urgency=medium
 
   * No-change version bump
