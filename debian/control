@@ -7,7 +7,8 @@ Build-Depends:
  adduser,
  debhelper-compat (= 13),
  libevent-dev,
- libio-socket-ssl-perl <!nocheck>,
+# Pexip: removed in order to prevent SSL checks as they need perl to be patched
+# libio-socket-ssl-perl <!nocheck>,
  libsasl2-dev,
  libssl-dev,
  pkg-config,
