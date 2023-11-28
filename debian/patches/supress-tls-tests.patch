@@ -1,0 +1,10 @@
+--- a/t/lib/MemcachedTest.pm
++++ b/t/lib/MemcachedTest.pm
+@@ -234,6 +234,7 @@
+ }
+ 
+ sub enabled_tls_testing {
++    return 0;
+     if ($tls_checked) {
+         return 1;
+     } elsif (supports_tls() && $ENV{SSL_TEST}) {

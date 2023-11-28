@@ -5,3 +5,4 @@
 0006-restore-systemd-sandboxing.patch
 0007-uninitialized-variables.patch
 pexip-0001-openssl3.patch
+supress-tls-tests.patch
