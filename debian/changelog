@@ -1,3 +1,9 @@
+memcached (1.6.18-1+pexip24u6) pexip-bookworm; urgency=medium
+
+  * New versioning scheme
+
+ -- Mark Hymers <mark.hymers@pexip.com>  Thu, 01 Feb 2024 16:12:18 +0000
+
 memcached (1.6.18-1pexip5) pexip-bookworm; urgency=medium
 
   * Bookworm build for product distribution
