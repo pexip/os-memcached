@@ -5,21 +5,16 @@
 // mcp.add_stat(index, name)
 // creates a custom lua stats counter
 int mcplib_add_stat(lua_State *L) {
-    LIBEVENT_THREAD *t = lua_touserdata(L, lua_upvalueindex(MCP_THREAD_UPVALUE));
-    if (t != NULL) {
-        proxy_lua_error(L, "add_stat must be called from config_pools");
-        return 0;
-    }
     int idx = luaL_checkinteger(L, -2);
     const char *name = luaL_checkstring(L, -1);
+    proxy_ctx_t *ctx = PROXY_GET_CTX(L);
 
     if (idx < 1) {
         proxy_lua_error(L, "stat index must be 1 or higher");
         return 0;
     }
-    // max user counters? 1024? some weird number.
-    if (idx > 1024) {
-        proxy_lua_error(L, "stat index must be 1024 or less");
+    if (idx > ctx->tunables.max_ustats) {
+        proxy_lua_ferror(L, "stat index must be %d or less", ctx->tunables.max_ustats);
         return 0;
     }
     // max name length? avoids errors if something huge gets thrown in.
@@ -36,41 +31,50 @@ int mcplib_add_stat(lua_State *L) {
         }
     }
 
-    proxy_ctx_t *ctx = lua_touserdata(L, lua_upvalueindex(MCP_CONTEXT_UPVALUE));
-
     STAT_L(ctx);
-    struct proxy_user_stats *us = &ctx->user_stats;
+    int stats_num = ctx->user_stats_num;
+    struct proxy_user_stats_entry *entries = ctx->user_stats;
 
     // if num_stats is 0 we need to init sizes.
     // TODO (v2): malloc fail checking. (should be rare/impossible)
-    if (us->num_stats < idx) {
-        // don't allocate counters memory for the global ctx.
-        char **nnames = calloc(idx, sizeof(char *));
-        if (us->names != NULL) {
-            for (int x = 0; x < us->num_stats; x++) {
-                nnames[x] = us->names[x];
-            }
-            free(us->names);
+    if (stats_num < idx) {
+        struct proxy_user_stats_entry *nentries = calloc(idx, sizeof(*entries));
+        // funny realloc; start with zeroed memory and copy in original.
+        if (entries) {
+            memcpy(nentries, entries, sizeof(*entries) * stats_num);
+            free(entries);
         }
-        us->names = nnames;
-        us->num_stats = idx;
+        ctx->user_stats = nentries;
+        ctx->user_stats_num = idx;
+        entries = nentries;
     }
 
     idx--; // real slot start as 0.
-    // if slot has string in it, free first
-    if (us->names[idx] != NULL) {
-        free(us->names[idx]);
+    if (entries[idx].name != NULL) {
+        // If name changed, we have to reset the counter in the slot.
+        // Also only free/strdup the string if it's changed.
+        if (strcmp(name, entries[idx].name) != 0) {
+            entries[idx].reset = true;
+            free(entries[idx].name);
+            entries[idx].name = strdup(name);
+        }
+        // else the stat name didn't change, so don't do anything.
+    } else if (entries[idx].cname) {
+        char *oldname = ctx->user_stats_namebuf + entries[idx].cname;
+        if (strcmp(name, oldname) != 0) {
+            entries[idx].reset = true;
+            entries[idx].name = strdup(name);
+        }
+    } else {
+        entries[idx].name = strdup(name);
     }
-    // strdup name into string slot
-    // TODO (v2): malloc failure.
-    us->names[idx] = strdup(name);
     STAT_UL(ctx);
 
     return 0;
 }
 
 int mcplib_stat(lua_State *L) {
-    LIBEVENT_THREAD *t = lua_touserdata(L, lua_upvalueindex(MCP_THREAD_UPVALUE));
+    LIBEVENT_THREAD *t = PROXY_GET_THR(L);
     if (t == NULL) {
         proxy_lua_error(L, "stat must be called from router handlers");
         return 0;

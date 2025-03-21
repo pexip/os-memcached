@@ -26,6 +26,7 @@ memcached_SOURCES = memcached.c memcached.h \
                     crawler.c crawler.h \
                     itoa_ljust.c itoa_ljust.h \
                     slab_automove.c slab_automove.h \
+                    slabs_mover.c slabs_mover.h \
                     authfile.c authfile.h \
                     restart.c restart.h \
                     proto_text.c proto_text.h \
@@ -57,12 +58,20 @@ endif
 
 if ENABLE_PROXY
 memcached_SOURCES += proto_proxy.c proto_proxy.h vendor/mcmc/mcmc.h \
+					 vendor/mcmc/mcmc.c \
 					 proxy_xxhash.c proxy.h \
-					 proxy_await.c proxy_ustats.c \
+					 proxy_ustats.c \
+					 proxy_ratelim.c \
 					 proxy_jump_hash.c proxy_request.c \
+					 proxy_result.c proxy_inspector.c \
+					 proxy_mutator.c \
 					 proxy_network.c proxy_lua.c \
+					 proxy_luafgen.c \
 					 proxy_config.c proxy_ring_hash.c \
-					 md5.c md5.h
+					 proxy_internal.c \
+					 proxy_tls.c proxy_tls.h \
+					 md5.c md5.h \
+					 vendor/routelib/routelib.h
 endif
 
 if ENABLE_EXTSTORE
@@ -82,6 +91,8 @@ memcached_debug_LDADD = @PROFILER_LDFLAGS@
 memcached_debug_CFLAGS = @PROFILER_FLAGS@
 
 memcached_LDADD =
+memcached_LDFLAGS =
+memcached_debug_LDFLAGS =
 memcached_DEPENDENCIES =
 memcached_debug_DEPENDENCIES =
 CLEANFILES=
@@ -105,8 +116,10 @@ CLEANFILES += memcached_dtrace.o memcached_debug_dtrace.o
 endif
 
 if ENABLE_PROXY
-memcached_LDADD += vendor/lua/src/liblua.a vendor/mcmc/mcmc.o
-memcached_debug_LDADD += vendor/lua/src/liblua.a vendor/mcmc/mcmc.o
+memcached_LDADD += vendor/lua/src/liblua.a
+memcached_debug_LDADD += vendor/lua/src/liblua.a
+memcached_LDFLAGS += -rdynamic
+memcached_debug_LDFLAGS += -rdynamic
 endif
 
 if ENABLE_PROXY_URING
@@ -138,7 +151,10 @@ memcached_debug_dtrace.o: $(memcached_debug_OBJECTS)
 SUBDIRS = doc
 DIST_DIRS = scripts
 EXTRA_DIST = doc scripts t memcached.spec memcached_dtrace.d version.m4 README.md LICENSE.bipbuffer
-EXTRA_DIST += vendor/Makefile vendor/lua vendor/mcmc
+EXTRA_DIST += vendor/Makefile vendor/lua/doc/* vendor/lua/Makefile vendor/lua/README
+EXTRA_DIST += vendor/lua/src/*.c vendor/lua/src/*.h vendor/lua/src/Makefile
+EXTRA_DIST += vendor/mcmc/LICENSE vendor/mcmc/Makefile vendor/mcmc/README.md vendor/mcmc/*.c vendor/mcmc/*.h
+EXTRA_DIST += vendor/routelib/*.h vendor/routelib/*.lua
 
 if ENABLE_PROXY
 SUBDIRS += vendor

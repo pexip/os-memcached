@@ -27,7 +27,7 @@ BuildRequires: systemd-units
 %endif
 
 Name:           memcached
-Version:        1.6.18
+Version:        1.6.38
 Release:        1%{?dist}
 Summary:        High Performance, Distributed Memory Object Cache
 
@@ -137,7 +137,7 @@ if [ "$1" = 0 ] ; then
     /bin/systemctl stop %{name}.service > /dev/null 2>&1 || :
     /bin/systemctl stop %{name}@\*.service > /dev/null 2>&1 || :
 %else
-    /sbin/service %{name} stop > /dev/null 2&>1 || :
+    /sbin/service %{name} stop > /dev/null 2>&1 || :
     /sbin/chkconfig --del %{name}
 %endif
 fi

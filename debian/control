@@ -9,9 +9,9 @@ Build-Depends:
  libio-socket-ssl-perl <!nocheck>,
  libsasl2-dev,
  libssl-dev,
- pkg-config,
+ pkgconf,
 Homepage: https://memcached.org/
-Standards-Version: 4.6.1
+Standards-Version: 4.7.0
 Vcs-Browser: https://salsa.debian.org/lamby/pkg-memcached
 Vcs-Git: https://salsa.debian.org/lamby/pkg-memcached.git
 Rules-Requires-Root: no
@@ -31,6 +31,7 @@ Suggests:
  libanyevent-perl,
  libcache-memcached-perl,
  libmemcached,
+ liburi-perl,
  libterm-readkey-perl,
  libyaml-perl,
 Description: High-performance in-memory object caching system

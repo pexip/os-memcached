@@ -233,7 +233,7 @@ static void *assoc_maintenance_thread(void *arg) {
                     }
 
             } else {
-                usleep(10*1000);
+                usleep(10*1000 - 1);
             }
 
             if (item_lock) {
@@ -307,8 +307,12 @@ void *assoc_get_iterator(void) {
         return NULL;
     }
     // this will hang the caller while a hash table expansion is running.
-    mutex_lock(&maintenance_lock);
-    return iter;
+    if (mutex_trylock(&maintenance_lock) == 0) {
+        return iter;
+    } else {
+        free(iter);
+        return NULL;
+    }
 }
 
 bool assoc_iterate(void *iterp, item **it) {

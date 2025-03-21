@@ -130,6 +130,15 @@ AC_ARG_ENABLE(proxy,
 AC_ARG_ENABLE(proxy-uring,
   [AS_HELP_STRING([--enable-proxy-uring], [Enable proxy io_uring code EXPERIMENTAL])])
 
+AC_ARG_ENABLE(proxy-tls,
+  [AS_HELP_STRING([--enable-proxy-tls], [Enable proxy io_uring code EXPERIMENTAL])])
+
+AC_ARG_ENABLE(werror,
+  [AS_HELP_STRING([--enable-werror], [Enable -Werror])])
+
+AC_ARG_ENABLE(large-client-flags,
+  [AS_HELP_STRING([--enable-large-client-flags], [Change client flags from 32bit to 64bit EXPERIMENTAL])])
+
 dnl **********************************************************************
 dnl DETECT_SASL_CB_GETCONF
 dnl
@@ -249,6 +258,18 @@ if test "x$enable_proxy_uring" = "xyes"; then
     CPPFLAGS="-Ivendor/liburing/src/include $CPPFLAGS"
 fi
 
+if test "x$enable_proxy_tls" = "xyes"; then
+    if test "x$enable_tls" != "xyes"; then
+        AC_MSG_ERROR([--enable-proxy-tls requires --enable-tls])
+    else
+        AC_DEFINE([PROXY_TLS],1,[Set to nonzero if you want to enable proxy backend tls support])
+    fi
+fi
+
+if test "x$enable_large_client_flags" = "xyes"; then
+    AC_DEFINE([LARGE_CLIENT_FLAGS],1,[Set to nonzero if you want 64bit client flags])
+fi
+
 AM_CONDITIONAL([BUILD_DTRACE],[test "$build_dtrace" = "yes"])
 AM_CONDITIONAL([DTRACE_INSTRUMENT_OBJ],[test "$dtrace_instrument_obj" = "yes"])
 AM_CONDITIONAL([ENABLE_SASL],[test "$enable_sasl" = "yes"])
@@ -260,6 +281,8 @@ AM_CONDITIONAL([ENABLE_STATIC],[test "$enable_static" = "yes"])
 AM_CONDITIONAL([DISABLE_UNIX_SOCKET],[test "$enable_unix_socket" = "no"])
 AM_CONDITIONAL([ENABLE_PROXY],[test "$enable_proxy" = "yes"])
 AM_CONDITIONAL([ENABLE_PROXY_URING],[test "$enable_proxy_uring" = "yes"])
+AM_CONDITIONAL([ENABLE_PROXY_TLS],[test "$enable_proxy_tls" = "yes"])
+AM_CONDITIONAL([LARGE_CLIENT_FLAGS],[test "$enable_large_client_flags" = "yes"])
 
 
 AC_SUBST(DTRACE)
@@ -485,7 +508,7 @@ if test "x$enable_tls" = "xyes"; then
     #include <sys/types.h>
     #include <assert.h>
     #include <openssl/ssl.h>], [ SSL_CTX* ssl_ctx = SSL_CTX_new(TLS_server_method());
-                                assert(OPENSSL_VERSION_NUMBER >= 0x10100000L);],
+                                assert(OPENSSL_VERSION_NUMBER >= 0x10101000L);],
            [ libssl_linked=yes ], [ libssl_linked=no ])
         if test $libssl_linked = yes; then
           if test ! -z "$ledir" ; then
@@ -553,6 +576,7 @@ AH_BOTTOM([#ifdef HAVE_INTTYPES_H
 #include <inttypes.h>
 #endif
 ])
+AC_CHECK_HEADERS([sys/auxv.h])
 
 dnl **********************************************************************
 dnl Figure out if this system has the stupid sasl_callback_ft
@@ -682,6 +706,7 @@ AC_CHECK_FUNCS(clock_gettime)
 AC_CHECK_FUNCS(preadv)
 AC_CHECK_FUNCS(pread)
 AC_CHECK_FUNCS(eventfd)
+AC_CHECK_FUNCS([pthread_setname_np],[AC_DEFINE(HAVE_PTHREAD_SETNAME_NP, 1, [Define to 1 if support pthread_setname_np])])
 AC_CHECK_FUNCS([accept4], [AC_DEFINE(HAVE_ACCEPT4, 1, [Define to 1 if support accept4])])
 AC_CHECK_FUNCS([getopt_long], [AC_DEFINE(HAVE_GETOPT_LONG, 1, [Define to 1 if support getopt_long])])
 
@@ -829,6 +854,10 @@ AM_CONDITIONAL([BUILD_SPECIFICATIONS],
                [test "x$enable_docs" != "xno" -a "x$XML2RFC" != "xno" -a "x$XSLTPROC" != "xno"])
 
 
+if test "x$enable_werror" = "xyes"; then
+   CFLAGS="$CFLAGS -Werror"
+fi
+
 dnl Let the compiler be a bit more picky. Please note that you cannot
 dnl specify these flags to the compiler before AC_CHECK_FUNCS, because
 dnl the test program will generate a compilation warning and hence fail
@@ -836,12 +865,12 @@ dnl to detect the function ;-)
 if test "$ICC" = "yes"
 then
    dnl ICC trying to be gcc.
-   CFLAGS="$CFLAGS -diag-disable 187 -Wall -Werror"
+   CFLAGS="$CFLAGS -diag-disable 187 -Wall"
    AC_DEFINE([_GNU_SOURCE],[1],[make sure IOV_MAX is defined])
 elif test "$GCC" = "yes"
 then
   GCC_VERSION=`$CC -dumpversion`
-  CFLAGS="$CFLAGS -Wall -Werror -pedantic -Wmissing-prototypes -Wmissing-declarations -Wredundant-decls"
+  CFLAGS="$CFLAGS -Wall -pedantic -Wmissing-prototypes -Wmissing-declarations -Wredundant-decls"
   if test "x$enable_asan" = "xyes"; then
     CFLAGS="$CFLAGS -fsanitize=address"
   fi
