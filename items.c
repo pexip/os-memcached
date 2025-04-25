@@ -1,20 +1,15 @@
 /* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 #include "memcached.h"
 #include "bipbuffer.h"
-#include "slab_automove.h"
 #include "storage.h"
-#ifdef EXTSTORE
-#include "slab_automove_extstore.h"
-#endif
+#include "slabs_mover.h"
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/resource.h>
 #include <fcntl.h>
 #include <netinet/in.h>
-#include <errno.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <signal.h>
 #include <string.h>
 #include <time.h>
 #include <assert.h>
@@ -58,15 +53,12 @@ static itemstats_t itemstats[LARGEST_ID];
 static unsigned int sizes[LARGEST_ID];
 static uint64_t sizes_bytes[LARGEST_ID];
 static unsigned int *stats_sizes_hist = NULL;
-static uint64_t stats_sizes_cas_min = 0;
 static int stats_sizes_buckets = 0;
-static uint64_t cas_id = 0;
+static uint64_t cas_id = 1;
 
 static volatile int do_run_lru_maintainer_thread = 0;
-static int lru_maintainer_initialized = 0;
 static pthread_mutex_t lru_maintainer_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t cas_id_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t stats_sizes_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void item_stats_reset(void) {
     int i;
@@ -124,14 +116,9 @@ void set_cas_id(uint64_t new_cas) {
 
 int item_is_flushed(item *it) {
     rel_time_t oldest_live = settings.oldest_live;
-    uint64_t cas = ITEM_get_cas(it);
-    uint64_t oldest_cas = settings.oldest_cas;
-    if (oldest_live == 0 || oldest_live > current_time)
-        return 0;
-    if ((it->time <= oldest_live)
-            || (oldest_cas != 0 && cas != 0 && cas < oldest_cas)) {
+    if (it->time <= oldest_live && oldest_live <= current_time)
         return 1;
-    }
+
     return 0;
 }
 
@@ -162,7 +149,7 @@ unsigned int do_get_lru_size(uint32_t id) {
  *
  * Returns the total size of the header.
  */
-static size_t item_make_header(const uint8_t nkey, const unsigned int flags, const int nbytes,
+static size_t item_make_header(const uint8_t nkey, const client_flags_t flags, const int nbytes,
                      char *suffix, uint8_t *nsuffix) {
     if (flags == 0) {
         *nsuffix = 0;
@@ -186,7 +173,7 @@ item *do_item_alloc_pull(const size_t ntotal, const unsigned int id) {
         if (!settings.lru_segmented) {
             lru_pull_tail(id, COLD_LRU, 0, 0, 0, NULL);
         }
-        it = slabs_alloc(ntotal, id, 0);
+        it = slabs_alloc(id, 0);
 
         if (it == NULL) {
             // We send '0' in for "total_bytes" as this routine is always
@@ -259,7 +246,7 @@ item_chunk *do_item_alloc_chunk(item_chunk *ch, const size_t bytes_remain) {
     return nch;
 }
 
-item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
+item *do_item_alloc(const char *key, const size_t nkey, const client_flags_t flags,
                     const rel_time_t exptime, const int nbytes) {
     uint8_t nsuffix;
     item *it = NULL;
@@ -361,7 +348,6 @@ item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
 }
 
 void item_free(item *it) {
-    size_t ntotal = ITEM_ntotal(it);
     unsigned int clsid;
     assert((it->it_flags & ITEM_LINKED) == 0);
     assert(it != heads[it->slabs_clsid]);
@@ -371,14 +357,14 @@ void item_free(item *it) {
     /* so slab size changer can tell later if item is already free or not */
     clsid = ITEM_clsid(it);
     DEBUG_REFCNT(it, 'F');
-    slabs_free(it, ntotal, clsid);
+    slabs_free(it, clsid);
 }
 
 /**
  * Returns true if an item will fit in the cache (its size does not exceed
  * the maximum for a cache entry.)
  */
-bool item_size_ok(const size_t nkey, const int flags, const int nbytes) {
+bool item_size_ok(const size_t nkey, const client_flags_t flags, const int nbytes) {
     char prefix[40];
     uint8_t nsuffix;
     if (nbytes < 2)
@@ -496,7 +482,7 @@ static void item_unlink_q(item *it) {
     pthread_mutex_unlock(&lru_locks[it->slabs_clsid]);
 }
 
-int do_item_link(item *it, const uint32_t hv) {
+int do_item_link(item *it, const uint32_t hv, const uint64_t cas) {
     MEMCACHED_ITEM_LINK(ITEM_key(it), it->nkey, it->nbytes);
     assert((it->it_flags & (ITEM_LINKED|ITEM_SLABBED)) == 0);
     it->it_flags |= ITEM_LINKED;
@@ -509,7 +495,7 @@ int do_item_link(item *it, const uint32_t hv) {
     STATS_UNLOCK();
 
     /* Allocate a new CAS ID on link. */
-    ITEM_set_cas(it, (settings.use_cas) ? get_cas_id() : 0);
+    ITEM_set_cas(it, cas);
     assoc_insert(it, hv);
     item_link_q(it);
     refcount_incr(it);
@@ -589,13 +575,58 @@ void do_item_update(item *it) {
     }
 }
 
-int do_item_replace(item *it, item *new_it, const uint32_t hv) {
+int do_item_replace(item *it, item *new_it, const uint32_t hv, const uint64_t cas) {
     MEMCACHED_ITEM_REPLACE(ITEM_key(it), it->nkey, it->nbytes,
                            ITEM_key(new_it), new_it->nkey, new_it->nbytes);
     assert((it->it_flags & ITEM_SLABBED) == 0);
 
     do_item_unlink(it, hv);
-    return do_item_link(new_it, hv);
+    return do_item_link(new_it, hv, cas);
+}
+
+void item_flush_expired(void) {
+    int i;
+    item *iter, *next;
+    if (settings.oldest_live == 0)
+        return;
+    for (i = 0; i < LARGEST_ID; i++) {
+        /* The LRU is sorted in decreasing time order, and an item's timestamp
+         * is never newer than its last access time, so we only need to walk
+         * back until we hit an item older than the oldest_live time.
+         * The oldest_live checking will auto-expire the remaining items.
+         */
+        pthread_mutex_lock(&lru_locks[i]);
+        for (iter = heads[i]; iter != NULL; iter = next) {
+            void *hold_lock = NULL;
+            next = iter->next;
+            if (iter->time == 0 && iter->nkey == 0 && iter->it_flags == 1) {
+                continue; // crawler item.
+            }
+            uint32_t hv = hash(ITEM_key(iter), iter->nkey);
+            // if we can't lock the item, just give up.
+            // we can't block here because the lock order is inverted.
+            if ((hold_lock = item_trylock(hv)) == NULL) {
+                continue;
+            }
+
+            if (iter->time >= settings.oldest_live) {
+                // note: not sure why SLABBED check is here. linked and slabbed
+                // are mutually exclusive, but this can't hurt and I don't
+                // want to validate it right now.
+                if ((iter->it_flags & ITEM_SLABBED) == 0) {
+                    STORAGE_delete(ext_storage, iter);
+                    // nolock version because we hold the LRU lock already.
+                    do_item_unlink_nolock(iter, hash(ITEM_key(iter), iter->nkey));
+                }
+                item_trylock_unlock(hold_lock);
+            } else {
+                /* We've hit the first old item. Continue to the next queue. */
+                item_trylock_unlock(hold_lock);
+                break;
+            }
+        }
+        pthread_mutex_unlock(&lru_locks[i]);
+    }
 }
 
 /*@null@*/
@@ -657,7 +688,7 @@ char *item_cachedump(const unsigned int slabs_clsid, const unsigned int limit, u
     return buffer;
 }
 
-/* With refactoring of the various stats code the automover won't need a
+/* With refactoring of the various stats code the automover shouldn't need a
  * custom function here.
  */
 void fill_item_stats_automove(item_stats_automove *am) {
@@ -701,11 +732,11 @@ void item_stats_totals(ADD_STAT add_stats, void *c) {
         for (x = 0; x < 4; x++) {
             i = n | lru_type_map[x];
             pthread_mutex_lock(&lru_locks[i]);
+            totals.evicted += itemstats[i].evicted;
+            totals.reclaimed += itemstats[i].reclaimed;
             totals.expired_unfetched += itemstats[i].expired_unfetched;
             totals.evicted_unfetched += itemstats[i].evicted_unfetched;
             totals.evicted_active += itemstats[i].evicted_active;
-            totals.evicted += itemstats[i].evicted;
-            totals.reclaimed += itemstats[i].reclaimed;
             totals.crawler_reclaimed += itemstats[i].crawler_reclaimed;
             totals.crawler_items_checked += itemstats[i].crawler_items_checked;
             totals.lrutail_reflocked += itemstats[i].lrutail_reflocked;
@@ -771,9 +802,9 @@ void item_stats(ADD_STAT add_stats, void *c) {
             pthread_mutex_lock(&lru_locks[i]);
             totals.evicted += itemstats[i].evicted;
             totals.evicted_nonzero += itemstats[i].evicted_nonzero;
+            totals.reclaimed += itemstats[i].reclaimed;
             totals.outofmemory += itemstats[i].outofmemory;
             totals.tailrepairs += itemstats[i].tailrepairs;
-            totals.reclaimed += itemstats[i].reclaimed;
             totals.expired_unfetched += itemstats[i].expired_unfetched;
             totals.evicted_unfetched += itemstats[i].evicted_unfetched;
             totals.evicted_active += itemstats[i].evicted_active;
@@ -883,10 +914,8 @@ void item_stats(ADD_STAT add_stats, void *c) {
 
 bool item_stats_sizes_status(void) {
     bool ret = false;
-    mutex_lock(&stats_sizes_lock);
     if (stats_sizes_hist != NULL)
         ret = true;
-    mutex_unlock(&stats_sizes_lock);
     return ret;
 }
 
@@ -895,40 +924,10 @@ void item_stats_sizes_init(void) {
         return;
     stats_sizes_buckets = settings.item_size_max / 32 + 1;
     stats_sizes_hist = calloc(stats_sizes_buckets, sizeof(int));
-    stats_sizes_cas_min = (settings.use_cas) ? get_cas_id() : 0;
-}
-
-void item_stats_sizes_enable(ADD_STAT add_stats, void *c) {
-    mutex_lock(&stats_sizes_lock);
-    if (!settings.use_cas) {
-        APPEND_STAT("sizes_status", "error", "");
-        APPEND_STAT("sizes_error", "cas_support_disabled", "");
-    } else if (stats_sizes_hist == NULL) {
-        item_stats_sizes_init();
-        if (stats_sizes_hist != NULL) {
-            APPEND_STAT("sizes_status", "enabled", "");
-        } else {
-            APPEND_STAT("sizes_status", "error", "");
-            APPEND_STAT("sizes_error", "no_memory", "");
-        }
-    } else {
-        APPEND_STAT("sizes_status", "enabled", "");
-    }
-    mutex_unlock(&stats_sizes_lock);
-}
-
-void item_stats_sizes_disable(ADD_STAT add_stats, void *c) {
-    mutex_lock(&stats_sizes_lock);
-    if (stats_sizes_hist != NULL) {
-        free(stats_sizes_hist);
-        stats_sizes_hist = NULL;
-    }
-    APPEND_STAT("sizes_status", "disabled", "");
-    mutex_unlock(&stats_sizes_lock);
 }
 
 void item_stats_sizes_add(item *it) {
-    if (stats_sizes_hist == NULL || stats_sizes_cas_min > ITEM_get_cas(it))
+    if (stats_sizes_hist == NULL)
         return;
     int ntotal = ITEM_ntotal(it);
     int bucket = ntotal / 32;
@@ -940,7 +939,7 @@ void item_stats_sizes_add(item *it) {
  * Since items getting their time value bumped will pass this validation.
  */
 void item_stats_sizes_remove(item *it) {
-    if (stats_sizes_hist == NULL || stats_sizes_cas_min > ITEM_get_cas(it))
+    if (stats_sizes_hist == NULL)
         return;
     int ntotal = ITEM_ntotal(it);
     int bucket = ntotal / 32;
@@ -955,8 +954,6 @@ void item_stats_sizes_remove(item *it) {
  * which don't change.
  */
 void item_stats_sizes(ADD_STAT add_stats, void *c) {
-    mutex_lock(&stats_sizes_lock);
-
     if (stats_sizes_hist != NULL) {
         int i;
         for (i = 0; i < stats_sizes_buckets; i++) {
@@ -971,34 +968,13 @@ void item_stats_sizes(ADD_STAT add_stats, void *c) {
     }
 
     add_stats(NULL, 0, NULL, 0, c);
-    mutex_unlock(&stats_sizes_lock);
 }
 
 /** wrapper around assoc_find which does the lazy expiration logic */
-item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c, const bool do_update) {
+item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, LIBEVENT_THREAD *t, const bool do_update) {
     item *it = assoc_find(key, nkey, hv);
     if (it != NULL) {
         refcount_incr(it);
-        /* Optimization for slab reassignment. prevents popular items from
-         * jamming in busy wait. Can only do this here to satisfy lock order
-         * of item_lock, slabs_lock. */
-        /* This was made unsafe by removal of the cache_lock:
-         * slab_rebalance_signal and slab_rebal.* are modified in a separate
-         * thread under slabs_lock. If slab_rebalance_signal = 1, slab_start =
-         * NULL (0), but slab_end is still equal to some value, this would end
-         * up unlinking every item fetched.
-         * This is either an acceptable loss, or if slab_rebalance_signal is
-         * true, slab_start/slab_end should be put behind the slabs_lock.
-         * Which would cause a huge potential slowdown.
-         * Could also use a specific lock for slab_rebal.* and
-         * slab_rebalance_signal (shorter lock?)
-         */
-        /*if (slab_rebalance_signal &&
-            ((void *)it >= slab_rebal.slab_start && (void *)it < slab_rebal.slab_end)) {
-            do_item_unlink(it, hv);
-            do_item_remove(it);
-            it = NULL;
-        }*/
     }
     int was_found = 0;
 
@@ -1006,7 +982,7 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c
         int ii;
         if (it == NULL) {
             fprintf(stderr, "> NOT FOUND ");
-        } else {
+        } else if (was_found) {
             fprintf(stderr, "> FOUND KEY ");
         }
         for (ii = 0; ii < nkey; ++ii) {
@@ -1018,31 +994,31 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c
         was_found = 1;
         if (item_is_flushed(it)) {
             do_item_unlink(it, hv);
-            STORAGE_delete(c->thread->storage, it);
+            STORAGE_delete(t->storage, it);
             do_item_remove(it);
             it = NULL;
-            pthread_mutex_lock(&c->thread->stats.mutex);
-            c->thread->stats.get_flushed++;
-            pthread_mutex_unlock(&c->thread->stats.mutex);
+            pthread_mutex_lock(&t->stats.mutex);
+            t->stats.get_flushed++;
+            pthread_mutex_unlock(&t->stats.mutex);
             if (settings.verbose > 2) {
                 fprintf(stderr, " -nuked by flush");
             }
             was_found = 2;
         } else if (it->exptime != 0 && it->exptime <= current_time) {
             do_item_unlink(it, hv);
-            STORAGE_delete(c->thread->storage, it);
+            STORAGE_delete(t->storage, it);
             do_item_remove(it);
             it = NULL;
-            pthread_mutex_lock(&c->thread->stats.mutex);
-            c->thread->stats.get_expired++;
-            pthread_mutex_unlock(&c->thread->stats.mutex);
+            pthread_mutex_lock(&t->stats.mutex);
+            t->stats.get_expired++;
+            pthread_mutex_unlock(&t->stats.mutex);
             if (settings.verbose > 2) {
                 fprintf(stderr, " -nuked by expire");
             }
             was_found = 3;
         } else {
             if (do_update) {
-                do_item_bump(c, it, hv);
+                do_item_bump(t, it, hv);
             }
             DEBUG_REFCNT(it, '+');
         }
@@ -1051,8 +1027,8 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c
     if (settings.verbose > 2)
         fprintf(stderr, "\n");
     /* For now this is in addition to the above verbose logging. */
-    LOGGER_LOG(c->thread->l, LOG_FETCHERS, LOGGER_ITEM_GET, NULL, was_found, key,
-               nkey, (it) ? it->nbytes : 0, (it) ? ITEM_clsid(it) : 0, c->sfd);
+    LOGGER_LOG(t->l, LOG_FETCHERS, LOGGER_ITEM_GET, NULL, was_found, key,
+               nkey, (it) ? it->nbytes : 0, (it) ? ITEM_clsid(it) : 0, t->cur_sfd);
 
     return it;
 }
@@ -1060,7 +1036,7 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c
 // Requires lock held for item.
 // Split out of do_item_get() to allow mget functions to look through header
 // data before losing state modified via the bump function.
-void do_item_bump(conn *c, item *it, const uint32_t hv) {
+void do_item_bump(LIBEVENT_THREAD *t, item *it, const uint32_t hv) {
     /* We update the hit markers only during fetches.
      * An item needs to be hit twice overall to be considered
      * ACTIVE, but only needs a single hit to maintain activity
@@ -1075,7 +1051,7 @@ void do_item_bump(conn *c, item *it, const uint32_t hv) {
                 it->it_flags |= ITEM_ACTIVE;
                 if (ITEM_lruid(it) != COLD_LRU) {
                     it->time = current_time; // only need to bump time.
-                } else if (!lru_bump_async(c->thread->lru_bump_buf, it, hv)) {
+                } else if (!lru_bump_async(t->lru_bump_buf, it, hv)) {
                     // add flag before async bump to avoid race.
                     it->it_flags &= ~ITEM_ACTIVE;
                 }
@@ -1088,8 +1064,8 @@ void do_item_bump(conn *c, item *it, const uint32_t hv) {
 }
 
 item *do_item_touch(const char *key, size_t nkey, uint32_t exptime,
-                    const uint32_t hv, conn *c) {
-    item *it = do_item_get(key, nkey, hv, c, DO_UPDATE);
+                    const uint32_t hv, LIBEVENT_THREAD *t) {
+    item *it = do_item_get(key, nkey, hv, t, DO_UPDATE);
     if (it != NULL) {
         it->exptime = exptime;
     }
@@ -1236,7 +1212,7 @@ int lru_pull_tail(const int orig_id, const int cur_lru,
                     do_item_unlink_nolock(search, hv);
                     removed++;
                     if (settings.slab_automove == 2) {
-                        slabs_reassign(-1, orig_id);
+                        slabs_reassign(settings.slab_rebal, -1, orig_id, SLABS_REASSIGN_ALLOW_EVICTIONS);
                     }
                 } else if (flags & LRU_PULL_RETURN_ITEM) {
                     /* Keep a reference to this item and return it. */
@@ -1565,35 +1541,16 @@ static void lru_maintainer_crawler_check(struct crawler_expired_data *cdata, log
     }
 }
 
-slab_automove_reg_t slab_automove_default = {
-    .init = slab_automove_init,
-    .free = slab_automove_free,
-    .run = slab_automove_run
-};
-#ifdef EXTSTORE
-slab_automove_reg_t slab_automove_extstore = {
-    .init = slab_automove_extstore_init,
-    .free = slab_automove_extstore_free,
-    .run = slab_automove_extstore_run
-};
-#endif
 static pthread_t lru_maintainer_tid;
 
-#define MAX_LRU_MAINTAINER_SLEEP 1000000
+#define MAX_LRU_MAINTAINER_SLEEP (1000000-1)
 #define MIN_LRU_MAINTAINER_SLEEP 1000
 
 static void *lru_maintainer_thread(void *arg) {
-    slab_automove_reg_t *sam = &slab_automove_default;
-#ifdef EXTSTORE
-    void *storage = arg;
-    if (storage != NULL)
-        sam = &slab_automove_extstore;
-#endif
     int i;
     useconds_t to_sleep = MIN_LRU_MAINTAINER_SLEEP;
     useconds_t last_sleep = MIN_LRU_MAINTAINER_SLEEP;
     rel_time_t last_crawler_check = 0;
-    rel_time_t last_automove_check = 0;
     useconds_t next_juggles[MAX_NUMBER_OF_SLAB_CLASSES] = {0};
     useconds_t backoff_juggles[MAX_NUMBER_OF_SLAB_CLASSES] = {0};
     struct crawler_expired_data *cdata =
@@ -1609,9 +1566,6 @@ static void *lru_maintainer_thread(void *arg) {
         fprintf(stderr, "Failed to allocate logger for LRU maintainer thread\n");
         abort();
     }
-
-    double last_ratio = settings.slab_automove_ratio;
-    void *am = sam->init(&settings);
 
     pthread_mutex_lock(&lru_maintainer_lock);
     if (settings.verbose > 2)
@@ -1670,31 +1624,8 @@ static void *lru_maintainer_thread(void *arg) {
             lru_maintainer_crawler_check(cdata, l);
             last_crawler_check = current_time;
         }
-
-        if (settings.slab_automove == 1 && last_automove_check != current_time) {
-            if (last_ratio != settings.slab_automove_ratio) {
-                sam->free(am);
-                am = sam->init(&settings);
-                last_ratio = settings.slab_automove_ratio;
-            }
-            int src, dst;
-            sam->run(am, &src, &dst);
-            if (src != -1 && dst != -1) {
-                slabs_reassign(src, dst);
-                LOGGER_LOG(l, LOG_SYSEVENTS, LOGGER_SLAB_MOVE, NULL,
-                        src, dst);
-            }
-            // dst == 0 means reclaim to global pool, be more aggressive
-            if (dst != 0) {
-                last_automove_check = current_time;
-            } else if (dst == 0) {
-                // also ensure we minimize the thread sleep
-                to_sleep = 1000;
-            }
-        }
     }
     pthread_mutex_unlock(&lru_maintainer_lock);
-    sam->free(am);
     // LRU crawler *must* be stopped.
     free(cdata);
     if (settings.verbose > 2)
@@ -1743,11 +1674,6 @@ void lru_maintainer_pause(void) {
 
 void lru_maintainer_resume(void) {
     pthread_mutex_unlock(&lru_maintainer_lock);
-}
-
-int init_lru_maintainer(void) {
-    lru_maintainer_initialized = 1;
-    return 0;
 }
 
 /* Tail linkers and crawler for the LRU crawler. */

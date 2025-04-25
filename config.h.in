@@ -84,6 +84,9 @@
 /* Define to 1 if you have the `preadv' function. */
 #undef HAVE_PREADV
 
+/* Define to 1 if support pthread_setname_np */
+#undef HAVE_PTHREAD_SETNAME_NP
+
 /* Define to 1 if you have the `sandbox_init' function. */
 #undef HAVE_SANDBOX_INIT
 
@@ -123,6 +126,9 @@
 /* Define to 1 if you have the `sysconf' function. */
 #undef HAVE_SYSCONF
 
+/* Define to 1 if you have the <sys/auxv.h> header file. */
+#undef HAVE_SYS_AUXV_H
+
 /* Define to 1 if you have the <sys/stat.h> header file. */
 #undef HAVE_SYS_STAT_H
 
@@ -134,6 +140,9 @@
 
 /* Define to 1 if the system has the type `_Bool'. */
 #undef HAVE__BOOL
+
+/* Set to nonzero if you want 64bit client flags */
+#undef LARGE_CLIENT_FLAGS
 
 /* Machine need alignment */
 #undef NEED_ALIGN
@@ -161,6 +170,9 @@
 
 /* Set to nonzero if you want to enable proxy code */
 #undef PROXY
+
+/* Set to nonzero if you want to enable proxy backend tls support */
+#undef PROXY_TLS
 
 /* The size of `void *', as computed by sizeof. */
 #undef SIZEOF_VOID_P

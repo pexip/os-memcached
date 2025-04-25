@@ -17,6 +17,7 @@
 #include "storage.h"
 #include "authfile.h"
 #include "restart.h"
+#include "slabs_mover.h"
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -50,9 +51,7 @@
 #include <getopt.h>
 #endif
 
-#ifdef TLS
 #include "tls.h"
-#endif
 
 #include "proto_text.h"
 #include "proto_bin.h"
@@ -109,8 +108,6 @@ struct settings settings;
 time_t process_started;     /* when the process was started */
 conn **conns;
 
-struct slab_rebalance slab_rebal;
-volatile int slab_rebalance_signal;
 #ifdef EXTSTORE
 /* hoping this is temporary; I'd prefer to cut globals, but will complete this
  * battle another day.
@@ -221,28 +218,13 @@ static void settings_init(void) {
     settings.access = 0700;
     settings.port = 11211;
     settings.udpport = 0;
-#ifdef TLS
-    settings.ssl_enabled = false;
-    settings.ssl_ctx = NULL;
-    settings.ssl_chain_cert = NULL;
-    settings.ssl_key = NULL;
-    settings.ssl_verify_mode = SSL_VERIFY_NONE;
-    settings.ssl_keyformat = SSL_FILETYPE_PEM;
-    settings.ssl_ciphers = NULL;
-    settings.ssl_ca_cert = NULL;
-    settings.ssl_last_cert_refresh_time = current_time;
-    settings.ssl_wbuf_size = 16 * 1024; // default is 16KB (SSL max frame size is 17KB)
-    settings.ssl_session_cache = false;
-    settings.ssl_kernel_tls = false;
-    settings.ssl_min_version = TLS1_2_VERSION;
-#endif
+    ssl_init_settings();
     /* By default this string should be NULL for getaddrinfo() */
     settings.inter = NULL;
     settings.maxbytes = 64 * 1024 * 1024; /* default is 64MB */
     settings.maxconns = 1024;         /* to limit connections-related memory to about 5MB */
     settings.verbose = 0;
     settings.oldest_live = 0;
-    settings.oldest_cas = 0;          /* supplements accuracy of oldest_live */
     settings.evict_to_free = 1;       /* push old items out of cache when memory runs out */
     settings.socketpath = NULL;       /* by default, not using a unix socket */
     settings.auth_file = NULL;        /* by default, not using ASCII authentication tokens */
@@ -275,8 +257,9 @@ static void settings_init(void) {
     settings.hashpower_init = 0;
     settings.slab_reassign = true;
     settings.slab_automove = 1;
+    settings.slab_automove_version = 0;
     settings.slab_automove_ratio = 0.8;
-    settings.slab_automove_window = 30;
+    settings.slab_automove_window = 10;
     settings.shutdown_command = false;
     settings.tail_repair_time = TAIL_REPAIR_TIME_DEFAULT;
     settings.flush_enabled = true;
@@ -424,9 +407,9 @@ static bool rbuf_alloc(conn *c) {
     if (c->rbuf == NULL) {
         c->rbuf = do_cache_alloc(c->thread->rbuf_cache);
         if (!c->rbuf) {
-            THR_STATS_LOCK(c);
+            THR_STATS_LOCK(c->thread);
             c->thread->stats.read_buf_oom++;
-            THR_STATS_UNLOCK(c);
+            THR_STATS_UNLOCK(c->thread);
             return false;
         }
         c->rsize = READ_BUFFER_SIZE;
@@ -538,16 +521,7 @@ void conn_close_idle(conn *c) {
     }
 }
 
-/* bring conn back from a sidethread. could have had its event base moved. */
-void conn_worker_readd(conn *c) {
-    if (c->state == conn_io_queue) {
-        c->io_queues_submitted--;
-        // If we're still waiting for other queues to return, don't re-add the
-        // connection yet.
-        if (c->io_queues_submitted != 0) {
-            return;
-        }
-    }
+static void _conn_event_readd(conn *c) {
     c->ev_flags = EV_READ | EV_PERSIST;
     event_set(&c->event, c->sfd, c->ev_flags, event_handler, (void *)c);
     event_base_set(c->thread->base, &c->event);
@@ -556,56 +530,56 @@ void conn_worker_readd(conn *c) {
     if (event_add(&c->event, 0) == -1) {
         perror("event_add");
     }
-
-    // side thread wanted us to close immediately.
-    if (c->state == conn_closing) {
-        drive_machine(c);
-        return;
-    } else if (c->state == conn_io_queue) {
-        // machine will know how to return based on secondary state.
-        drive_machine(c);
-    } else {
-        conn_set_state(c, conn_new_cmd);
-    }
 }
 
-void thread_io_queue_add(LIBEVENT_THREAD *t, int type, void *ctx, io_queue_stack_cb cb, io_queue_stack_cb com_cb, io_queue_cb ret_cb, io_queue_cb fin_cb) {
-    io_queue_cb_t *q = t->io_queues;
+/* bring conn back from a sidethread. could have had its event base moved. */
+void conn_worker_readd(conn *c) {
+    assert(c->resps_suspended == 0); // TODO: remove assert.
+
+    switch (c->state) {
+        case conn_closing:
+            drive_machine(c);
+            break;
+        case conn_io_pending:
+            // The event listener was removed as more data showed up while
+            // waiting for the async response.
+            _conn_event_readd(c);
+            // Explicit fall-through.
+        case conn_io_queue:
+            conn_set_state(c, conn_io_resume);
+            // schedule the event, which just runs drive_machine outside of
+            // any recursion here.
+            event_active(&c->event, 0, 0);
+            break;
+        case conn_write:
+        case conn_mwrite:
+        case conn_read:
+        case conn_parse_cmd:
+            // No-ops if we weren't in a suspended state to begin with
+            // TODO: which other states for this?
+            break;
+        default:
+            event_del(&c->event);
+            _conn_event_readd(c);
+            conn_set_state(c, conn_new_cmd);
+    }
+
+}
+
+void thread_io_queue_add(LIBEVENT_THREAD *t, int type, void *ctx, io_queue_stack_cb cb) {
+    io_queue_t *q = t->io_queues;
     while (q->type != IO_QUEUE_NONE) {
         q++;
     }
     q->type = type;
     q->ctx = ctx;
     q->submit_cb = cb;
-    q->complete_cb = com_cb;
-    q->finalize_cb = fin_cb;
-    q->return_cb   = ret_cb;
+    STAILQ_INIT(&q->stack);
     return;
 }
 
-void conn_io_queue_setup(conn *c) {
-    io_queue_cb_t *qcb = c->thread->io_queues;
-    io_queue_t *q = c->io_queues;
-    while (qcb->type != IO_QUEUE_NONE) {
-        q->type = qcb->type;
-        q->ctx = qcb->ctx;
-        q->stack_ctx = NULL;
-        q->count = 0;
-        qcb++;
-        q++;
-    }
-}
-
-// To be called from conn_release_items to ensure the stack ptrs are reset.
-static void conn_io_queue_reset(conn *c) {
-    for (io_queue_t *q = c->io_queues; q->type != IO_QUEUE_NONE; q++) {
-        assert(q->count == 0);
-        q->stack_ctx = NULL;
-    }
-}
-
-io_queue_cb_t *thread_io_queue_get(LIBEVENT_THREAD *t, int type) {
-    io_queue_cb_t *q = t->io_queues;
+io_queue_t *thread_io_queue_get(LIBEVENT_THREAD *t, int type) {
+    io_queue_t *q = t->io_queues;
     while (q->type != IO_QUEUE_NONE) {
         if (q->type == type) {
             return q;
@@ -615,37 +589,20 @@ io_queue_cb_t *thread_io_queue_get(LIBEVENT_THREAD *t, int type) {
     return NULL;
 }
 
-io_queue_t *conn_io_queue_get(conn *c, int type) {
-    io_queue_t *q = c->io_queues;
-    while (q->type != IO_QUEUE_NONE) {
-        if (q->type == type) {
-            return q;
+void thread_io_queue_submit(LIBEVENT_THREAD *t) {
+    t->conns_tosubmit = 0;
+    for (io_queue_t *q = t->io_queues; q->type != IO_QUEUE_NONE; q++) {
+        // submission callback must consume the queue
+        if (!STAILQ_EMPTY(&q->stack)) {
+            q->submit_cb(q);
+            assert(STAILQ_EMPTY(&q->stack));
         }
-        q++;
-    }
-    return NULL;
-}
-
-// called after returning to the main worker thread.
-// users of the queue need to distinguish if the IO was actually consumed or
-// not and handle appropriately.
-static void conn_io_queue_complete(conn *c) {
-    io_queue_t *q = c->io_queues;
-    io_queue_cb_t *qcb = c->thread->io_queues;
-    while (q->type != IO_QUEUE_NONE) {
-        if (q->stack_ctx) {
-            qcb->complete_cb(q);
-        }
-        qcb++;
-        q++;
     }
 }
 
 // called to return a single IO object to the original worker thread.
 void conn_io_queue_return(io_pending_t *io) {
-    io_queue_cb_t *q = thread_io_queue_get(io->thread, io->io_queue_type);
-    q->return_cb(io);
-    return;
+    io->return_cb(io);
 }
 
 conn *conn_new(const int sfd, enum conn_states init_state,
@@ -747,11 +704,6 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         }
     }
 
-#ifdef TLS
-    c->ssl = NULL;
-    c->ssl_wbuf = NULL;
-    c->ssl_enabled = false;
-#endif
     c->state = init_state;
     c->rlbytes = 0;
     c->cmd = -1;
@@ -765,31 +717,26 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     c->mset_res = false;
     c->close_after_write = false;
     c->last_cmd_time = current_time; /* initialize for idle kicker */
-    // wipe all queues.
-    memset(c->io_queues, 0, sizeof(c->io_queues));
-    c->io_queues_submitted = 0;
+    assert(c->resps_suspended == 0);
 
     c->item = 0;
+    c->ssl = NULL;
+#ifdef TLS
+    c->ssl_wbuf = NULL;
+#endif
 
     c->noreply = false;
 
-#ifdef TLS
     if (ssl) {
-        c->ssl = (SSL*)ssl;
-        c->read = ssl_read;
-        c->sendmsg = ssl_sendmsg;
-        c->write = ssl_write;
+        // musn't get here without ssl enabled.
+        assert(settings.ssl_enabled);
+        ssl_init_conn(c, ssl);
         c->ssl_enabled = true;
-        SSL_set_info_callback(c->ssl, ssl_callback);
-    } else
-#else
-    // This must be NULL if TLS is not enabled.
-    assert(ssl == NULL);
-#endif
-    {
+    } else {
         c->read = tcp_read;
         c->sendmsg = tcp_sendmsg;
         c->write = tcp_write;
+        c->ssl_enabled = false;
     }
 
     if (IS_UDP(transport)) {
@@ -872,7 +819,6 @@ void conn_release_items(conn *c) {
             }
             resp = resp_finish(c, resp);
         }
-        conn_io_queue_reset(c);
     }
 }
 
@@ -881,7 +827,7 @@ static void conn_cleanup(conn *c) {
 
     conn_release_items(c);
 #ifdef PROXY
-    if (c->proxy_coro_ref) {
+    if (c->proxy_rctx) {
         proxy_cleanup_conn(c);
     }
 #endif
@@ -942,12 +888,9 @@ static void conn_close(conn *c) {
 
     MEMCACHED_CONN_RELEASE(c->sfd);
     conn_set_state(c, conn_closed);
-#ifdef TLS
-    if (c->ssl) {
-        SSL_shutdown(c->ssl);
-        SSL_free(c->ssl);
+    if (c->ssl_enabled) {
+        ssl_conn_close(c->ssl);
     }
-#endif
     close(c->sfd);
     c->close_reason = 0;
     pthread_mutex_lock(&conn_lock);
@@ -989,7 +932,9 @@ static const char *state_text(enum conn_states state) {
                                        "conn_mwrite",
                                        "conn_closed",
                                        "conn_watch",
-                                       "conn_io_queue" };
+                                       "conn_io_queue",
+                                       "conn_io_resume",
+                                       "conn_io_pending" };
     return statenames[state];
 }
 
@@ -1025,6 +970,14 @@ void resp_reset(mc_resp *resp) {
         resp->item = NULL;
     }
     if (resp->write_and_free) {
+#ifdef PROXY
+        if (resp->proxy_res) {
+            LIBEVENT_THREAD *t = resp->bundle->thread;
+            pthread_mutex_lock(&t->proxy_limit_lock);
+            t->proxy_buffer_memory_used -= resp->wbytes;
+            pthread_mutex_unlock(&t->proxy_limit_lock);
+        }
+#endif
         free(resp->write_and_free);
         resp->write_and_free = NULL;
     }
@@ -1077,7 +1030,9 @@ static mc_resp* resp_allocate(conn *c) {
 
         if (resp != NULL) {
             b->refcount++;
-            resp->free = false;
+            memset(resp, 0, sizeof(*resp));
+            resp->free = false; // redundant, for clarity.
+            resp->bundle = b;
             if (b->refcount == MAX_RESP_PER_BUNDLE) {
                 assert(b->prev == NULL);
                 // We only allocate off the head. Assign new head.
@@ -1095,20 +1050,22 @@ static mc_resp* resp_allocate(conn *c) {
         assert(th->open_bundle == NULL);
         b = do_cache_alloc(th->rbuf_cache);
         if (b) {
-            THR_STATS_LOCK(c);
-            c->thread->stats.response_obj_bytes += READ_BUFFER_SIZE;
-            THR_STATS_UNLOCK(c);
+            THR_STATS_LOCK(th);
+            th->stats.response_obj_bytes += READ_BUFFER_SIZE;
+            THR_STATS_UNLOCK(th);
             b->next_check = 1;
             b->refcount = 1;
             for (int i = 0; i < MAX_RESP_PER_BUNDLE; i++) {
-                b->r[i].bundle = b;
                 b->r[i].free = true;
             }
             b->next = 0;
             b->prev = 0;
+            b->thread = th;
             th->open_bundle = b;
             resp = &b->r[0];
-            resp->free = false;
+            memset(resp, 0, sizeof(*resp));
+            resp->free = false; // redundant. for clarity.
+            resp->bundle = b;
         } else {
             return NULL;
         }
@@ -1117,8 +1074,7 @@ static mc_resp* resp_allocate(conn *c) {
     return resp;
 }
 
-static void resp_free(conn *c, mc_resp *resp) {
-    LIBEVENT_THREAD *th = c->thread;
+void resp_free(LIBEVENT_THREAD *th, mc_resp *resp) {
     mc_resp_bundle *b = resp->bundle;
 
     resp->free = true;
@@ -1143,9 +1099,9 @@ static void resp_free(conn *c, mc_resp *resp) {
 
             // Now completely done with this buffer.
             do_cache_free(th->rbuf_cache, b);
-            THR_STATS_LOCK(c);
-            c->thread->stats.response_obj_bytes -= READ_BUFFER_SIZE;
-            THR_STATS_UNLOCK(c);
+            THR_STATS_LOCK(th);
+            th->stats.response_obj_bytes -= READ_BUFFER_SIZE;
+            THR_STATS_UNLOCK(th);
         }
     } else {
         mc_resp_bundle **head = &th->open_bundle;
@@ -1161,30 +1117,25 @@ static void resp_free(conn *c, mc_resp *resp) {
         }
 
     }
+    THR_STATS_LOCK(th);
+    th->stats.response_obj_count--;
+    THR_STATS_UNLOCK(th);
 }
 
 bool resp_start(conn *c) {
     mc_resp *resp = resp_allocate(c);
     if (!resp) {
-        THR_STATS_LOCK(c);
+        THR_STATS_LOCK(c->thread);
         c->thread->stats.response_obj_oom++;
-        THR_STATS_UNLOCK(c);
+        THR_STATS_UNLOCK(c->thread);
         return false;
     }
+
     // handling the stats counters here to simplify testing
-    THR_STATS_LOCK(c);
+    THR_STATS_LOCK(c->thread);
     c->thread->stats.response_obj_count++;
-    THR_STATS_UNLOCK(c);
-    // Skip zeroing the bundle pointer at the start.
-    // TODO: this line is here temporarily to make the code easy to disable.
-    // when it's more mature, move the memset into resp_allocate() and have it
-    // set the bundle pointer on allocate so this line isn't as complex.
-    memset((char *)resp + sizeof(mc_resp_bundle*), 0, sizeof(*resp) - sizeof(mc_resp_bundle*));
-    // TODO: this next line works. memset _does_ show up significantly under
-    // perf reports due to zeroing out the entire resp->wbuf. before swapping
-    // the lines more validation work should be done to ensure wbuf's aren't
-    // accidentally reused without being written to.
-    //memset((char *)resp + sizeof(mc_resp_bundle*), 0, offsetof(mc_resp, wbuf));
+    THR_STATS_UNLOCK(c->thread);
+
     if (!c->resp_head) {
         c->resp_head = resp;
     }
@@ -1203,6 +1154,30 @@ bool resp_start(conn *c) {
     return true;
 }
 
+mc_resp *resp_start_unlinked(conn *c) {
+    mc_resp *resp = resp_allocate(c);
+    if (!resp) {
+        THR_STATS_LOCK(c->thread);
+        c->thread->stats.response_obj_oom++;
+        THR_STATS_UNLOCK(c->thread);
+        return false;
+    }
+
+    // handling the stats counters here to simplify testing
+    THR_STATS_LOCK(c->thread);
+    c->thread->stats.response_obj_count++;
+    THR_STATS_UNLOCK(c->thread);
+
+    if (IS_UDP(c->transport)) {
+        // need to hold on to some data for async responses.
+        c->resp->request_id = c->request_id;
+        c->resp->request_addr = c->request_addr;
+        c->resp->request_addr_size = c->request_addr_size;
+    }
+
+    return resp;
+}
+
 // returns next response in chain.
 mc_resp* resp_finish(conn *c, mc_resp *resp) {
     mc_resp *next = resp->next;
@@ -1212,14 +1187,22 @@ mc_resp* resp_finish(conn *c, mc_resp *resp) {
         resp->item = NULL;
     }
     if (resp->write_and_free) {
+#ifdef PROXY
+        if (resp->proxy_res) {
+            LIBEVENT_THREAD *t = resp->bundle->thread;
+            pthread_mutex_lock(&t->proxy_limit_lock);
+            t->proxy_buffer_memory_used -= resp->wbytes;
+            pthread_mutex_unlock(&t->proxy_limit_lock);
+        }
+#endif
         free(resp->write_and_free);
     }
     if (resp->io_pending) {
+        io_pending_t *io = resp->io_pending;
         // If we had a pending IO, tell it to internally clean up then return
         // the main object back to our thread cache.
-        io_queue_cb_t *qcb = thread_io_queue_get(c->thread, resp->io_pending->io_queue_type);
-        qcb->finalize_cb(resp->io_pending);
-        do_cache_free(c->thread->io_cache, resp->io_pending);
+        io->finalize_cb(io);
+        do_cache_free(c->thread->io_cache, io);
         resp->io_pending = NULL;
     }
     if (c->resp_head == resp) {
@@ -1228,10 +1211,7 @@ mc_resp* resp_finish(conn *c, mc_resp *resp) {
     if (c->resp == resp) {
         c->resp = NULL;
     }
-    resp_free(c, resp);
-    THR_STATS_LOCK(c);
-    c->thread->stats.response_obj_count--;
-    THR_STATS_UNLOCK(c);
+    resp_free(c->thread, resp);
     return next;
 }
 
@@ -1534,7 +1514,7 @@ static int _store_item_copy_chunks(item *d_it, item *s_it, const int len) {
 }
 
 static int _store_item_copy_data(int comm, item *old_it, item *new_it, item *add_it) {
-    if (comm == NREAD_APPEND) {
+    if (comm == NREAD_APPEND || comm == NREAD_APPENDVIV) {
         if (new_it->it_flags & ITEM_CHUNKED) {
             if (_store_item_copy_chunks(new_it, old_it, old_it->nbytes - 2) == -1 ||
                 _store_item_copy_chunks(new_it, add_it, add_it->nbytes) == -1) {
@@ -1565,15 +1545,15 @@ static int _store_item_copy_data(int comm, item *old_it, item *new_it, item *add
  *
  * Returns the state of storage.
  */
-enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t hv) {
+enum store_item_type do_store_item(item *it, int comm, LIBEVENT_THREAD *t, const uint32_t hv, int *nbytes, uint64_t *cas, uint64_t cas_in, bool cas_stale) {
     char *key = ITEM_key(it);
-    item *old_it = do_item_get(key, it->nkey, hv, c, DONT_UPDATE);
+    item *old_it = do_item_get(key, it->nkey, hv, t, DONT_UPDATE);
     enum store_item_type stored = NOT_STORED;
 
     enum cas_result { CAS_NONE, CAS_MATCH, CAS_BADVAL, CAS_STALE, CAS_MISS };
 
     item *new_it = NULL;
-    uint32_t flags;
+    client_flags_t flags;
 
     /* Do the CAS test up front so we can apply to all store modes */
     enum cas_result cas_res = CAS_NONE;
@@ -1587,7 +1567,7 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
             cas_res = CAS_NONE;
         } else if (it_cas == old_cas) {
             cas_res = CAS_MATCH;
-        } else if (c->set_stale && it_cas < old_cas) {
+        } else if (cas_stale && it_cas < old_cas) {
             cas_res = CAS_STALE;
         } else {
             cas_res = CAS_BADVAL;
@@ -1603,9 +1583,9 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
                     // cas validates
                     // it and old_it may belong to different classes.
                     // I'm updating the stats for the one that's getting pushed out
-                    pthread_mutex_lock(&c->thread->stats.mutex);
-                    c->thread->stats.slab_stats[ITEM_clsid(old_it)].cas_hits++;
-                    pthread_mutex_unlock(&c->thread->stats.mutex);
+                    pthread_mutex_lock(&t->stats.mutex);
+                    t->stats.slab_stats[ITEM_clsid(old_it)].cas_hits++;
+                    pthread_mutex_unlock(&t->stats.mutex);
                     do_store = true;
                 } else if (cas_res == CAS_STALE) {
                     // if we're allowed to set a stale value, CAS must be lower than
@@ -1618,15 +1598,15 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
                         it->it_flags |= ITEM_TOKEN_SENT;
                     }
 
-                    pthread_mutex_lock(&c->thread->stats.mutex);
-                    c->thread->stats.slab_stats[ITEM_clsid(old_it)].cas_hits++;
-                    pthread_mutex_unlock(&c->thread->stats.mutex);
+                    pthread_mutex_lock(&t->stats.mutex);
+                    t->stats.slab_stats[ITEM_clsid(old_it)].cas_hits++;
+                    pthread_mutex_unlock(&t->stats.mutex);
                     do_store = true;
                 } else {
                     // NONE or BADVAL are the same for CAS cmd
-                    pthread_mutex_lock(&c->thread->stats.mutex);
-                    c->thread->stats.slab_stats[ITEM_clsid(old_it)].cas_badval++;
-                    pthread_mutex_unlock(&c->thread->stats.mutex);
+                    pthread_mutex_lock(&t->stats.mutex);
+                    t->stats.slab_stats[ITEM_clsid(old_it)].cas_badval++;
+                    pthread_mutex_unlock(&t->stats.mutex);
 
                     if (settings.verbose > 1) {
                         fprintf(stderr, "CAS:  failure: expected %llu, got %llu\n",
@@ -1638,6 +1618,8 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
                 break;
             case NREAD_APPEND:
             case NREAD_PREPEND:
+            case NREAD_APPENDVIV:
+            case NREAD_PREPENDVIV:
                 if (cas_res != CAS_NONE && cas_res != CAS_MATCH) {
                     stored = EXISTS;
                     break;
@@ -1665,6 +1647,10 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
                     // it's original ref is managed outside of this function
                     it = new_it;
                     do_store = true;
+                    // Upstream final object size for meta
+                    if (nbytes != NULL) {
+                        *nbytes = it->nbytes;
+                    }
                 }
                 break;
             case NREAD_REPLACE:
@@ -1674,8 +1660,8 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
         }
 
         if (do_store) {
-            STORAGE_delete(c->thread->storage, old_it);
-            item_replace(old_it, it, hv);
+            STORAGE_delete(t->storage, old_it);
+            item_replace(old_it, it, hv, cas_in);
             stored = STORED;
         }
 
@@ -1694,14 +1680,16 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
         switch (comm) {
             case NREAD_ADD:
             case NREAD_SET:
+            case NREAD_APPENDVIV:
+            case NREAD_PREPENDVIV:
                 do_store = true;
                 break;
             case NREAD_CAS:
                 // LRU expired
                 stored = NOT_FOUND;
-                pthread_mutex_lock(&c->thread->stats.mutex);
-                c->thread->stats.cas_misses++;
-                pthread_mutex_unlock(&c->thread->stats.mutex);
+                pthread_mutex_lock(&t->stats.mutex);
+                t->stats.cas_misses++;
+                pthread_mutex_unlock(&t->stats.mutex);
                 break;
             case NREAD_REPLACE:
             case NREAD_APPEND:
@@ -1711,17 +1699,17 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
         }
 
         if (do_store) {
-            do_item_link(it, hv);
+            do_item_link(it, hv, cas_in);
             stored = STORED;
         }
     }
 
-    if (stored == STORED) {
-        c->cas = ITEM_get_cas(it);
+    if (stored == STORED && cas != NULL) {
+        *cas = ITEM_get_cas(it);
     }
-    LOGGER_LOG(c->thread->l, LOG_MUTATIONS, LOGGER_ITEM_STORE, NULL,
+    LOGGER_LOG(t->l, LOG_MUTATIONS, LOGGER_ITEM_STORE, NULL,
             stored, comm, ITEM_key(it), it->nkey, it->nbytes, it->exptime,
-            ITEM_clsid(it), c->sfd);
+            ITEM_clsid(it), t->cur_sfd);
 
     return stored;
 }
@@ -1757,7 +1745,7 @@ void append_stat(const char *name, ADD_STAT add_stats, conn *c,
 }
 
 /* return server specific stats only */
-void server_stats(ADD_STAT add_stats, conn *c) {
+void server_stats(ADD_STAT add_stats, void *c) {
     pid_t pid = getpid();
     rel_time_t now = current_time;
 
@@ -1809,7 +1797,6 @@ void server_stats(ADD_STAT add_stats, conn *c) {
         APPEND_STAT("proxy_conn_errors", "%llu", (unsigned long long)thread_stats.proxy_conn_errors);
         APPEND_STAT("proxy_conn_oom", "%llu", (unsigned long long)thread_stats.proxy_conn_oom);
         APPEND_STAT("proxy_req_active", "%llu", (unsigned long long)thread_stats.proxy_req_active);
-        APPEND_STAT("proxy_await_active", "%llu", (unsigned long long)thread_stats.proxy_await_active);
     }
 #endif
     APPEND_STAT("cmd_get", "%llu", (unsigned long long)thread_stats.get_cmds);
@@ -1822,7 +1809,7 @@ void server_stats(ADD_STAT add_stats, conn *c) {
     APPEND_STAT("get_expired", "%llu", (unsigned long long)thread_stats.get_expired);
     APPEND_STAT("get_flushed", "%llu", (unsigned long long)thread_stats.get_flushed);
 #ifdef EXTSTORE
-    if (c->thread->storage) {
+    if (ext_storage) {
         APPEND_STAT("get_extstore", "%llu", (unsigned long long)thread_stats.get_extstore);
         APPEND_STAT("get_aborted_extstore", "%llu", (unsigned long long)thread_stats.get_aborted_extstore);
         APPEND_STAT("get_oom_extstore", "%llu", (unsigned long long)thread_stats.get_oom_extstore);
@@ -1863,10 +1850,10 @@ void server_stats(ADD_STAT add_stats, conn *c) {
     if (settings.slab_reassign) {
         APPEND_STAT("slab_reassign_rescues", "%llu", stats.slab_reassign_rescues);
         APPEND_STAT("slab_reassign_chunk_rescues", "%llu", stats.slab_reassign_chunk_rescues);
-        APPEND_STAT("slab_reassign_evictions_nomem", "%llu", stats.slab_reassign_evictions_nomem);
         APPEND_STAT("slab_reassign_inline_reclaim", "%llu", stats.slab_reassign_inline_reclaim);
         APPEND_STAT("slab_reassign_busy_items", "%llu", stats.slab_reassign_busy_items);
         APPEND_STAT("slab_reassign_busy_deletes", "%llu", stats.slab_reassign_busy_deletes);
+        APPEND_STAT("slab_reassign_busy_nomem", "%llu", stats.slab_reassign_busy_nomem);
         APPEND_STAT("slab_reassign_running", "%u", stats_state.slab_reassign_running);
         APPEND_STAT("slabs_moved", "%llu", stats.slabs_moved);
     }
@@ -1897,6 +1884,7 @@ void server_stats(ADD_STAT add_stats, conn *c) {
             APPEND_STAT("ssl_new_sessions", "%llu", (unsigned long long)stats.ssl_new_sessions);
         }
         APPEND_STAT("ssl_handshake_errors", "%llu", (unsigned long long)stats.ssl_handshake_errors);
+        APPEND_STAT("ssl_proto_errors", "%llu", (unsigned long long)stats.ssl_proto_errors);
         APPEND_STAT("time_since_server_cert_refresh", "%u", now - settings.ssl_last_cert_refresh_time);
     }
 #endif
@@ -1997,6 +1985,7 @@ void process_stat_settings(ADD_STAT add_stats, void *c) {
 #endif
     APPEND_STAT("num_napi_ids", "%s", settings.num_napi_ids);
     APPEND_STAT("memory_file", "%s", settings.memory_file);
+    APPEND_STAT("client_flags_size", "%d", sizeof(client_flags_t));
 }
 
 static int nz_strcmp(int nzlength, const char *nz, const char *z) {
@@ -2023,10 +2012,6 @@ bool get_stats(const char *stat_type, int nkey, ADD_STAT add_stats, void *c) {
             slabs_stats(add_stats, c);
         } else if (nz_strcmp(nkey, stat_type, "sizes") == 0) {
             item_stats_sizes(add_stats, c);
-        } else if (nz_strcmp(nkey, stat_type, "sizes_enable") == 0) {
-            item_stats_sizes_enable(add_stats, c);
-        } else if (nz_strcmp(nkey, stat_type, "sizes_disable") == 0) {
-            item_stats_sizes_disable(add_stats, c);
         } else {
             ret = false;
         }
@@ -2126,6 +2111,7 @@ static void conn_to_str(const conn *c, char *addr, char *svr_addr) {
         if (c->state == conn_listening ||
                 (IS_UDP(c->transport) &&
                  c->state == conn_read)) {
+            memset(&local_addr, 0, sizeof(local_addr));
             socklen_t local_addr_len = sizeof(local_addr);
 
             if (getsockname(c->sfd,
@@ -2139,6 +2125,7 @@ static void conn_to_str(const conn *c, char *addr, char *svr_addr) {
         if (c->state != conn_listening && !(IS_UDP(c->transport) &&
                  c->state == conn_read)) {
             struct sockaddr_storage svr_sock_addr;
+            memset(&svr_sock_addr, 0, sizeof(svr_sock_addr));
             socklen_t svr_addr_len = sizeof(svr_sock_addr);
             getsockname(c->sfd, (struct sockaddr *)&svr_sock_addr, &svr_addr_len);
             get_conn_text(c, svr_sock_addr.ss_family, svr_addr, (struct sockaddr *)&svr_sock_addr);
@@ -2170,29 +2157,33 @@ void process_stats_conns(ADD_STAT add_stats, void *c) {
                 APPEND_NUM_STAT(i, "UDP", "%s", "UDP");
             }
             if (conns[i]->state != conn_closed) {
-                conn_to_str(conns[i], addr, svr_addr);
+                conn *sc = conns[i];
+                conn_to_str(sc, addr, svr_addr);
 
                 APPEND_NUM_STAT(i, "addr", "%s", addr);
-                if (conns[i]->state != conn_listening &&
-                    !(IS_UDP(conns[i]->transport) && conns[i]->state == conn_read)) {
+                if (sc->state != conn_listening &&
+                    !(IS_UDP(sc->transport) && sc->state == conn_read)) {
                     APPEND_NUM_STAT(i, "listen_addr", "%s", svr_addr);
                 }
                 APPEND_NUM_STAT(i, "state", "%s",
-                        state_text(conns[i]->state));
+                        state_text(sc->state));
+                if (sc->resps_suspended) {
+                    APPEND_NUM_STAT(i, "resps_waiting", "%d", sc->resps_suspended);
+                }
                 APPEND_NUM_STAT(i, "secs_since_last_cmd", "%d",
-                        current_time - conns[i]->last_cmd_time);
+                        current_time - sc->last_cmd_time);
             }
         }
     }
 }
 
 #define IT_REFCOUNT_LIMIT 60000
-item* limited_get(char *key, size_t nkey, conn *c, uint32_t exptime, bool should_touch, bool do_update, bool *overflow) {
+item* limited_get(const char *key, size_t nkey, LIBEVENT_THREAD *t, uint32_t exptime, bool should_touch, bool do_update, bool *overflow) {
     item *it;
     if (should_touch) {
-        it = item_touch(key, nkey, exptime, c);
+        it = item_touch(key, nkey, exptime, t);
     } else {
-        it = item_get(key, nkey, c, do_update);
+        it = item_get(key, nkey, t, do_update);
     }
     if (it && it->refcount > IT_REFCOUNT_LIMIT) {
         item_remove(it);
@@ -2208,9 +2199,9 @@ item* limited_get(char *key, size_t nkey, conn *c, uint32_t exptime, bool should
 // locked, caller can directly change what it needs.
 // though it might eventually be a better interface to sink it all into
 // items.c.
-item* limited_get_locked(char *key, size_t nkey, conn *c, bool do_update, uint32_t *hv, bool *overflow) {
+item* limited_get_locked(const char *key, size_t nkey, LIBEVENT_THREAD *t, bool do_update, uint32_t *hv, bool *overflow) {
     item *it;
-    it = item_get_locked(key, nkey, c, do_update, hv);
+    it = item_get_locked(key, nkey, t, do_update, hv);
     if (it && it->refcount > IT_REFCOUNT_LIMIT) {
         do_item_remove(it);
         it = NULL;
@@ -2233,7 +2224,7 @@ item* limited_get_locked(char *key, size_t nkey, conn *c, bool do_update, uint32
  *
  * returns a response string to send back to the client.
  */
-enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
+enum delta_result_type do_add_delta(LIBEVENT_THREAD *t, const char *key, const size_t nkey,
                                     const bool incr, const int64_t delta,
                                     char *buf, uint64_t *cas,
                                     const uint32_t hv,
@@ -2243,7 +2234,7 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
     int res;
     item *it;
 
-    it = do_item_get(key, nkey, hv, c, DONT_UPDATE);
+    it = do_item_get(key, nkey, hv, t, DONT_UPDATE);
     if (!it) {
         return DELTA_ITEM_NOT_FOUND;
     }
@@ -2273,23 +2264,23 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
 
     if (incr) {
         value += delta;
-        MEMCACHED_COMMAND_INCR(c->sfd, ITEM_key(it), it->nkey, value);
+        //MEMCACHED_COMMAND_INCR(c->sfd, ITEM_key(it), it->nkey, value);
     } else {
         if(delta > value) {
             value = 0;
         } else {
             value -= delta;
         }
-        MEMCACHED_COMMAND_DECR(c->sfd, ITEM_key(it), it->nkey, value);
+        //MEMCACHED_COMMAND_DECR(c->sfd, ITEM_key(it), it->nkey, value);
     }
 
-    pthread_mutex_lock(&c->thread->stats.mutex);
+    pthread_mutex_lock(&t->stats.mutex);
     if (incr) {
-        c->thread->stats.slab_stats[ITEM_clsid(it)].incr_hits++;
+        t->stats.slab_stats[ITEM_clsid(it)].incr_hits++;
     } else {
-        c->thread->stats.slab_stats[ITEM_clsid(it)].decr_hits++;
+        t->stats.slab_stats[ITEM_clsid(it)].decr_hits++;
     }
-    pthread_mutex_unlock(&c->thread->stats.mutex);
+    pthread_mutex_unlock(&t->stats.mutex);
 
     itoa_u64(value, buf);
     res = strlen(buf);
@@ -2310,7 +2301,7 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
         do_item_update(it);
     } else if (it->refcount > 1) {
         item *new_it;
-        uint32_t flags;
+        client_flags_t flags;
         FLAGS_CONV(it, flags);
         new_it = do_item_alloc(ITEM_key(it), it->nkey, flags, it->exptime, res + 2);
         if (new_it == 0) {
@@ -2319,7 +2310,7 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
         }
         memcpy(ITEM_data(new_it), buf, res);
         memcpy(ITEM_data(new_it) + res, "\r\n", 2);
-        item_replace(it, new_it, hv);
+        item_replace(it, new_it, hv, (settings.use_cas) ? get_cas_id() : 0);
         // Overwrite the older item's CAS with our new CAS since we're
         // returning the CAS of the old item below.
         ITEM_set_cas(it, (settings.use_cas) ? ITEM_get_cas(new_it) : 0);
@@ -2439,7 +2430,7 @@ static enum try_read_result try_read_network(conn *c) {
     assert(c != NULL);
 
     if (c->rcurr != c->rbuf) {
-        if (c->rbytes != 0) /* otherwise there's nothing to copy */
+        if (c->rbytes > 0) /* otherwise there's nothing to copy */
             memmove(c->rbuf, c->rcurr, c->rbytes);
         c->rcurr = c->rbuf;
     }
@@ -3037,48 +3028,13 @@ static void drive_machine(conn *c) {
                 res = write(sfd, str, strlen(str));
                 close(sfd);
             } else {
-                void *ssl_v = NULL;
-#ifdef TLS
-                SSL *ssl = NULL;
-                if (c->ssl_enabled) {
-                    assert(IS_TCP(c->transport) && settings.ssl_enabled);
-
-                    if (settings.ssl_ctx == NULL) {
-                        if (settings.verbose) {
-                            fprintf(stderr, "SSL context is not initialized\n");
-                        }
-                        close(sfd);
-                        break;
-                    }
-                    SSL_LOCK();
-                    ssl = SSL_new(settings.ssl_ctx);
-                    SSL_UNLOCK();
-                    if (ssl == NULL) {
-                        if (settings.verbose) {
-                            fprintf(stderr, "Failed to created the SSL object\n");
-                        }
-                        close(sfd);
-                        break;
-                    }
-                    SSL_set_fd(ssl, sfd);
-                    int ret = SSL_accept(ssl);
-                    if (ret <= 0) {
-                        int err = SSL_get_error(ssl, ret);
-                        if (err == SSL_ERROR_SYSCALL || err == SSL_ERROR_SSL) {
-                            if (settings.verbose) {
-                                fprintf(stderr, "SSL connection failed with error code : %d : %s\n", err, strerror(errno));
-                            }
-                            SSL_free(ssl);
-                            close(sfd);
-                            STATS_LOCK();
-                            stats.ssl_handshake_errors++;
-                            STATS_UNLOCK();
-                            break;
-                        }
-                    }
+                // run accept routine if ssl is compiled + enabled
+                bool fail = false;
+                void *ssl_v = ssl_accept(c, sfd, &fail);
+                if (fail) {
+                    close(sfd);
+                    break;
                 }
-                ssl_v = (void*) ssl;
-#endif
 
                 dispatch_conn_new(sfd, conn_new_cmd, EV_READ | EV_PERSIST,
                                      READ_BUFFER_CACHED, c->transport, ssl_v, c->tag, c->protocol);
@@ -3317,18 +3273,15 @@ static void drive_machine(conn *c) {
              * remove the connection from the worker thread and dispatch the
              * IO queue
              */
-            assert(c->io_queues_submitted == 0);
-
-            for (io_queue_t *q = c->io_queues; q->type != IO_QUEUE_NONE; q++) {
-                if (q->stack_ctx != NULL) {
-                    io_queue_cb_t *qcb = thread_io_queue_get(c->thread, q->type);
-                    qcb->submit_cb(q);
-                    c->io_queues_submitted++;
-                }
-            }
-            if (c->io_queues_submitted != 0) {
+            if (c->resps_suspended) {
+                LIBEVENT_THREAD *t = c->thread;
+                // FIXME: carefully check or document somewhere that submit
+                // cannot resume a connection in-line with submission.
                 conn_set_state(c, conn_io_queue);
-                event_del(&c->event);
+                if (t->conns_tosubmit++ > 20) {
+                    // Run occasional batches, else submit outside event loop.
+                    thread_io_queue_submit(c->thread);
+                }
 
                 stop = true;
                 break;
@@ -3378,8 +3331,17 @@ static void drive_machine(conn *c) {
             stop = true;
             break;
         case conn_io_queue:
+            /* Woke up while waiting for an async return, but not ready. */
+            event_del(&c->event);
+            conn_set_state(c, conn_io_pending);
+            stop = true;
+            break;
+        case conn_io_pending:
+            /* Should not be reachable */
+            assert(false);
+            break;
+        case conn_io_resume:
             /* Complete our queued IO's from within the worker thread. */
-            conn_io_queue_complete(c);
             conn_set_state(c, conn_mwrite);
             break;
         case conn_max_state:
@@ -3481,7 +3443,7 @@ static void maximize_sndbuf(const int sfd) {
 static int server_socket(const char *interface,
                          int port,
                          enum network_transport transport,
-                         FILE *portnumber_file, bool ssl_enabled,
+                         FILE *portnumber_file, uint8_t ssl_enabled,
                          uint64_t conntag,
                          enum protocol bproto) {
     int sfd;
@@ -3659,12 +3621,14 @@ static int server_socket(const char *interface,
 
 static int server_sockets(int port, enum network_transport transport,
                           FILE *portnumber_file) {
-    bool ssl_enabled = false;
+    uint8_t ssl_enabled = MC_SSL_DISABLED;
 
-#ifdef TLS
     const char *notls = "notls";
-    ssl_enabled = settings.ssl_enabled;
-#endif
+    const char *btls = "btls";
+    const char *mtls = "mtls";
+    if (settings.ssl_enabled) {
+        ssl_enabled = MC_SSL_ENABLED_DEFAULT;
+    }
 
     if (settings.inter == NULL) {
         return server_socket(settings.inter, port, transport, portnumber_file, ssl_enabled, 0, settings.binding_protocol);
@@ -3685,8 +3649,9 @@ static int server_sockets(int port, enum network_transport transport,
             p = strtok_r(NULL, ";,", &b)) {
             uint64_t conntag = 0;
             int the_port = port;
-#ifdef TLS
-            ssl_enabled = settings.ssl_enabled;
+            if (settings.ssl_enabled) {
+                ssl_enabled = MC_SSL_ENABLED_DEFAULT;
+            }
             // "notls" option is valid only when memcached is run with SSL enabled.
             if (strncmp(p, notls, strlen(notls)) == 0) {
                 if (!settings.ssl_enabled) {
@@ -3694,10 +3659,25 @@ static int server_sockets(int port, enum network_transport transport,
                     free(list);
                     return 1;
                 }
-                ssl_enabled = false;
+                ssl_enabled = MC_SSL_DISABLED;
                 p += strlen(notls) + 1;
+            } else if (strncmp(p, btls, strlen(btls)) == 0) {
+                 if (!settings.ssl_enabled) {
+                    fprintf(stderr, "'btls' option is valid only when SSL is enabled\n");
+                    free(list);
+                    return 1;
+                }
+                ssl_enabled = MC_SSL_ENABLED_NOPEER;
+                p += strlen(btls) + 1;
+            } else if (strncmp(p, mtls, strlen(mtls)) == 0) {
+                if (!settings.ssl_enabled) {
+                    fprintf(stderr, "'otls' option is valid only when SSL is enabled\n");
+                    free(list);
+                    return 1;
+                }
+                ssl_enabled = MC_SSL_ENABLED_PEER;
+                p += strlen(mtls) + 1;
             }
-#endif
 
             // Allow forcing the protocol of this listener.
             const char *protostr = "proto";
@@ -3744,8 +3724,13 @@ static int server_sockets(int port, enum network_transport transport,
             const char *tagstr = "tag";
             if (strncmp(p, tagstr, strlen(tagstr)) == 0) {
                 p += strlen(tagstr);
-                if (*p == '[') {
+                // NOTE: should probably retire the [] dumbassery. those're
+                // shell characters.
+                if (*p == '[' || *p == '_') {
                     char *e = strchr(p, ']');
+                    if (e == NULL) {
+                        e = strchr(p+1, '_');
+                    }
                     if (e == NULL) {
                         fprintf(stderr, "Invalid tag in socket config: \"%s\"\n", p);
                         free(list);
@@ -3985,7 +3970,7 @@ static const char* flag_enabled_disabled(bool flag) {
     return (flag ? "enabled" : "disabled");
 }
 
-static void verify_default(const char* param, bool condition) {
+void verify_default(const char* param, bool condition) {
     if (!condition) {
         printf("Default value of [%s] has changed."
             " Modify the help text and default value check.\n", param);
@@ -4050,7 +4035,7 @@ static void usage(void) {
     printf("-S, --enable-sasl         turn on Sasl authentication\n");
 #endif
     printf("-F, --disable-flush-all   disable flush_all command\n");
-    printf("-X, --disable-dumping     disable stats cachedump and lru_crawler metadump\n");
+    printf("-X, --disable-dumping     disable stats cachedump, stats detail, and lru_crawler metadump\n");
     printf("-W  --disable-watch       disable watch commands (live logging)\n");
     printf("-Y, --auth-file=<file>    (EXPERIMENTAL) enable ASCII protocol authentication. format:\n"
            "                          user:pass\\nuser2:pass2\\n\n");
@@ -4100,6 +4085,7 @@ static void usage(void) {
            "   - worker_logbuf_size:  size in kilobytes of per-worker-thread buffer\n"
            "                          read by background thread, then written to watchers. (default: %u)\n"
            "   - track_sizes:         enable dynamic reports for 'stats sizes' command.\n"
+           "                          note that counts for each size are approximate.\n"
            "   - no_hashexpand:       disables hash table expansion (dangerous)\n"
            "   - modern:              enables options which will be default in future.\n"
            "                          currently: nothing\n"
@@ -4136,10 +4122,10 @@ static void usage(void) {
            "   - ext_drop_unread:     don't re-write unread values during compaction (default: %s)\n"
            "   - ext_recache_rate:    recache an item every N accesses (default: %u)\n"
            "   - ext_compact_under:   compact when fewer than this many free pages\n"
-           "                          (default: 1/4th of the assigned storage)\n"
+           "                          (default: 1 percent of the assigned storage)\n"
            "   - ext_drop_under:      drop COLD items when fewer than this many free pages\n"
            "                          (default: 1/4th of the assigned storage)\n"
-           "   - ext_max_frag:        max page fragmentation to tolerate (default: %.2f)\n"
+           "   - ext_max_frag:        only defrag pages if they are less full than this pct-wise (default: %.2f)\n"
            "   - ext_max_sleep:       max sleep time of background threads in us (default: %u)\n"
            "   - slab_automove_freeratio: ratio of memory to hold free as buffer.\n"
            "                          (see doc/storage.txt for more info, default: %.3f)\n",
@@ -4150,40 +4136,14 @@ static void usage(void) {
     verify_default("ext_item_age", settings.ext_item_age == UINT_MAX);
 #endif
 #ifdef PROXY
-    printf("   - proxy_config:        path to lua config file.\n");
-#ifdef HAVE_LIBURING
-    printf("   - proxy_uring:         enable IO_URING for proxy backends.\n");
+    printf("   - proxy_config:        path to lua library file. separate with ':' for multiple files\n"
+           "                          use proxy_config=routelib to use built-in library\n"
+           "                          see https://memcached.org/proxy for information\n"
+            );
+    printf("   - proxy_arg:           argument string (file path) to pass to proxy config\n"
+            );
 #endif
-#endif
-#ifdef TLS
-    printf("   - ssl_chain_cert:      certificate chain file in PEM format\n"
-           "   - ssl_key:             private key, if not part of the -ssl_chain_cert\n"
-           "   - ssl_keyformat:       private key format (PEM, DER or ENGINE) (default: PEM)\n");
-    printf("   - ssl_verify_mode:     peer certificate verification mode, default is 0(None).\n"
-           "                          valid values are 0(None), 1(Request), 2(Require)\n"
-           "                          or 3(Once)\n");
-    printf("   - ssl_ciphers:         specify cipher list to be used\n"
-           "   - ssl_ca_cert:         PEM format file of acceptable client CA's\n"
-           "   - ssl_wbuf_size:       size in kilobytes of per-connection SSL output buffer\n"
-           "                          (default: %u)\n", settings.ssl_wbuf_size / (1 << 10));
-    printf("   - ssl_session_cache:   enable server-side SSL session cache, to support session\n"
-           "                          resumption\n"
-           "   - ssl_kernel_tls:      enable kernel TLS offload\n"
-           "   - ssl_min_version:     minimum protocol version to accept (default: %s)\n",
-           ssl_proto_text(settings.ssl_min_version));
-#if defined(TLS1_3_VERSION)
-    printf("                          valid values are 0(%s), 1(%s), 2(%s), or 3(%s).\n",
-           ssl_proto_text(TLS1_VERSION), ssl_proto_text(TLS1_1_VERSION),
-           ssl_proto_text(TLS1_2_VERSION), ssl_proto_text(TLS1_3_VERSION));
-#else
-    printf("                          valid values are 0(%s), 1(%s), or 2(%s).\n",
-           ssl_proto_text(TLS1_VERSION), ssl_proto_text(TLS1_1_VERSION),
-           ssl_proto_text(TLS1_2_VERSION));
-#endif
-    verify_default("ssl_keyformat", settings.ssl_keyformat == SSL_FILETYPE_PEM);
-    verify_default("ssl_verify_mode", settings.ssl_verify_mode == SSL_VERIFY_NONE);
-    verify_default("ssl_min_version", settings.ssl_min_version == TLS1_2_VERSION);
-#endif
+    ssl_help();
     printf("-N, --napi_ids            number of napi ids. see doc/napi_ids.txt for more details\n");
     return;
 }
@@ -4492,7 +4452,6 @@ static int _mc_meta_save_cb(const char *tag, void *ctx, void *data) {
     // Might as well just fetch the next CAS value to use than tightly
     // coupling the internal variable into the restart system.
     restart_set_kv(ctx, "current_cas", "%llu", (unsigned long long) get_cas_id());
-    restart_set_kv(ctx, "oldest_cas", "%llu", (unsigned long long) settings.oldest_cas);
     restart_set_kv(ctx, "logger_gid", "%llu", logger_get_gid());
     restart_set_kv(ctx, "hashpower", "%u", stats_state.hash_power_level);
     // NOTE: oldest_live is a rel_time_t, which aliases for unsigned int.
@@ -4510,7 +4469,7 @@ static int _mc_meta_save_cb(const char *tag, void *ctx, void *data) {
 // TODO: Once crc32'ing of the metadata file is done this could be ensured better by
 // the restart module itself (crc32 + count of lines must match on the
 // backend)
-#define RESTART_REQUIRED_META 17
+#define RESTART_REQUIRED_META 16
 
 // With this callback we make a decision on if the current configuration
 // matches up enough to allow reusing the cache.
@@ -4538,7 +4497,6 @@ static int _mc_meta_load_cb(const char *tag, void *ctx, void *data) {
         R_USE_CAS,
         R_SLAB_REASSIGN,
         R_CURRENT_CAS,
-        R_OLDEST_CAS,
         R_OLDEST_LIVE,
         R_LOGGER_GID,
         R_CURRENT_TIME,
@@ -4558,7 +4516,6 @@ static int _mc_meta_load_cb(const char *tag, void *ctx, void *data) {
         [R_USE_CAS] = "use_cas",
         [R_SLAB_REASSIGN] = "slab_reassign",
         [R_CURRENT_CAS] = "current_cas",
-        [R_OLDEST_CAS] = "oldest_cas",
         [R_OLDEST_LIVE] = "oldest_live",
         [R_LOGGER_GID] = "logger_gid",
         [R_CURRENT_TIME] = "current_time",
@@ -4648,13 +4605,6 @@ static int _mc_meta_load_cb(const char *tag, void *ctx, void *data) {
                 reuse_mmap = -1;
             } else {
                 set_cas_id(bigval_uint);
-            }
-            break;
-        case R_OLDEST_CAS:
-            if (!safe_strtoull(val, &bigval_uint)) {
-                reuse_mmap = -1;
-            } else {
-                settings.oldest_cas = bigval_uint;
             }
             break;
         case R_OLDEST_LIVE:
@@ -4811,7 +4761,9 @@ int main (int argc, char **argv) {
 #endif
 #ifdef PROXY
         PROXY_CONFIG,
+        PROXY_ARG,
         PROXY_URING,
+        PROXY_MEMPROFILE,
 #endif
 #ifdef MEMCACHED_DEBUG
         RELAXED_PRIVILEGES,
@@ -4873,7 +4825,9 @@ int main (int argc, char **argv) {
 #endif
 #ifdef PROXY
         [PROXY_CONFIG] = "proxy_config",
+        [PROXY_ARG] = "proxy_arg",
         [PROXY_URING] = "proxy_uring",
+        [PROXY_MEMPROFILE] = "proxy_memprofile",
 #endif
 #ifdef MEMCACHED_DEBUG
         [RELAXED_PRIVILEGES] = "relaxed_privileges",
@@ -4898,8 +4852,8 @@ int main (int argc, char **argv) {
     /* init settings */
     settings_init();
     verify_default("hash_algorithm", hash_type == MURMUR3_HASH);
-#ifdef EXTSTORE
     void *storage = NULL;
+#ifdef EXTSTORE
     void *storage_cf = storage_init_config(&settings);
     bool storage_enabled = false;
     if (storage_cf == NULL) {
@@ -4907,9 +4861,6 @@ int main (int argc, char **argv) {
         return 1;
     }
 #endif
-
-    /* Run regardless of initializing it later */
-    init_lru_maintainer();
 
     /* set stderr non-buffering (for running under, say, daemontools) */
     setbuf(stderr, NULL);
@@ -4999,6 +4950,11 @@ int main (int argc, char **argv) {
 #else
     while (-1 != (c = getopt(argc, argv, shortopts))) {
 #endif
+        if (optarg) {
+            while(isspace(optarg[0])) {
+                optarg++;
+            }
+        }
         switch (c) {
         case 'A':
             /* enables "shutdown" command */
@@ -5092,7 +5048,7 @@ int main (int argc, char **argv) {
             break;
         case 'R':
             settings.reqs_per_event = atoi(optarg);
-            if (settings.reqs_per_event == 0) {
+            if (settings.reqs_per_event <= 0) {
                 fprintf(stderr, "Number of requests per event must be greater than 0\n");
                 return 1;
             }
@@ -5116,7 +5072,7 @@ int main (int argc, char **argv) {
             break;
         case 'n':
             settings.chunk_size = atoi(optarg);
-            if (settings.chunk_size == 0) {
+            if (settings.chunk_size <= 0) {
                 fprintf(stderr, "Chunk size must be greater than 0\n");
                 return 1;
             }
@@ -5236,18 +5192,18 @@ int main (int argc, char **argv) {
             case HASHPOWER_INIT:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing numeric argument for hashpower\n");
-                    return 1;
+                    goto error;
                 }
                 settings.hashpower_init = atoi(subopts_value);
                 if (settings.hashpower_init < 12) {
                     fprintf(stderr, "Initial hashtable multiplier of %d is too low\n",
                         settings.hashpower_init);
-                    return 1;
+                    goto error;
                 } else if (settings.hashpower_init > 32) {
                     fprintf(stderr, "Initial hashtable multiplier of %d is too high\n"
                         "Choose a value based on \"STAT hash_power_level\" from a running instance\n",
                         settings.hashpower_init);
-                    return 1;
+                    goto error;
                 }
                 break;
             case NO_HASHEXPAND:
@@ -5264,46 +5220,46 @@ int main (int argc, char **argv) {
                 settings.slab_automove = atoi(subopts_value);
                 if (settings.slab_automove < 0 || settings.slab_automove > 2) {
                     fprintf(stderr, "slab_automove must be between 0 and 2\n");
-                    return 1;
+                    goto error;
                 }
                 break;
             case SLAB_AUTOMOVE_RATIO:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing slab_automove_ratio argument\n");
-                    return 1;
+                    goto error;
                 }
                 settings.slab_automove_ratio = atof(subopts_value);
                 if (settings.slab_automove_ratio <= 0 || settings.slab_automove_ratio > 1) {
                     fprintf(stderr, "slab_automove_ratio must be > 0 and < 1\n");
-                    return 1;
+                    goto error;
                 }
                 break;
             case SLAB_AUTOMOVE_WINDOW:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing slab_automove_window argument\n");
-                    return 1;
+                    goto error;
                 }
                 settings.slab_automove_window = atoi(subopts_value);
                 if (settings.slab_automove_window < 3) {
                     fprintf(stderr, "slab_automove_window must be > 2\n");
-                    return 1;
+                    goto error;
                 }
                 break;
             case TAIL_REPAIR_TIME:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing numeric argument for tail_repair_time\n");
-                    return 1;
+                    goto error;
                 }
                 settings.tail_repair_time = atoi(subopts_value);
                 if (settings.tail_repair_time < 10) {
                     fprintf(stderr, "Cannot set tail_repair_time to less than 10 seconds\n");
-                    return 1;
+                    goto error;
                 }
                 break;
             case HASH_ALGORITHM:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing hash_algorithm argument\n");
-                    return 1;
+                    goto error;
                 };
                 if (strcmp(subopts_value, "jenkins") == 0) {
                     hash_type = JENKINS_HASH;
@@ -5313,7 +5269,7 @@ int main (int argc, char **argv) {
                     hash_type = XXH3_HASH;
                 } else {
                     fprintf(stderr, "Unknown hash_algorithm option (jenkins, murmur3, xxh3)\n");
-                    return 1;
+                    goto error;
                 }
                 break;
             case LRU_CRAWLER:
@@ -5322,22 +5278,22 @@ int main (int argc, char **argv) {
             case LRU_CRAWLER_SLEEP:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing lru_crawler_sleep value\n");
-                    return 1;
+                    goto error;
                 }
                 settings.lru_crawler_sleep = atoi(subopts_value);
                 if (settings.lru_crawler_sleep > 1000000 || settings.lru_crawler_sleep < 0) {
                     fprintf(stderr, "LRU crawler sleep must be between 0 and 1 second\n");
-                    return 1;
+                    goto error;
                 }
                 break;
             case LRU_CRAWLER_TOCRAWL:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing lru_crawler_tocrawl value\n");
-                    return 1;
+                    goto error;
                 }
                 if (!safe_strtoul(subopts_value, &tocrawl)) {
                     fprintf(stderr, "lru_crawler_tocrawl takes a numeric 32bit value\n");
-                    return 1;
+                    goto error;
                 }
                 settings.lru_crawler_tocrawl = tocrawl;
                 break;
@@ -5348,51 +5304,51 @@ int main (int argc, char **argv) {
             case HOT_LRU_PCT:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing hot_lru_pct argument\n");
-                    return 1;
+                    goto error;
                 }
                 settings.hot_lru_pct = atoi(subopts_value);
                 if (settings.hot_lru_pct < 1 || settings.hot_lru_pct >= 80) {
                     fprintf(stderr, "hot_lru_pct must be > 1 and < 80\n");
-                    return 1;
+                    goto error;
                 }
                 break;
             case WARM_LRU_PCT:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing warm_lru_pct argument\n");
-                    return 1;
+                    goto error;
                 }
                 settings.warm_lru_pct = atoi(subopts_value);
                 if (settings.warm_lru_pct < 1 || settings.warm_lru_pct >= 80) {
                     fprintf(stderr, "warm_lru_pct must be > 1 and < 80\n");
-                    return 1;
+                    goto error;
                 }
                 break;
             case HOT_MAX_FACTOR:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing hot_max_factor argument\n");
-                    return 1;
+                    goto error;
                 }
                 settings.hot_max_factor = atof(subopts_value);
                 if (settings.hot_max_factor <= 0) {
                     fprintf(stderr, "hot_max_factor must be > 0\n");
-                    return 1;
+                    goto error;
                 }
                 break;
             case WARM_MAX_FACTOR:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing warm_max_factor argument\n");
-                    return 1;
+                    goto error;
                 }
                 settings.warm_max_factor = atof(subopts_value);
                 if (settings.warm_max_factor <= 0) {
                     fprintf(stderr, "warm_max_factor must be > 0\n");
-                    return 1;
+                    goto error;
                 }
                 break;
             case TEMPORARY_TTL:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing temporary_ttl argument\n");
-                    return 1;
+                    goto error;
                 }
                 settings.temp_lru = true;
                 settings.temporary_ttl = atoi(subopts_value);
@@ -5400,29 +5356,29 @@ int main (int argc, char **argv) {
             case IDLE_TIMEOUT:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing numeric argument for idle_timeout\n");
-                    return 1;
+                    goto error;
                 }
                 settings.idle_timeout = atoi(subopts_value);
                 break;
             case WATCHER_LOGBUF_SIZE:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing watcher_logbuf_size argument\n");
-                    return 1;
+                    goto error;
                 }
                 if (!safe_strtoul(subopts_value, &settings.logger_watcher_buf_size)) {
                     fprintf(stderr, "could not parse argument to watcher_logbuf_size\n");
-                    return 1;
+                    goto error;
                 }
                 settings.logger_watcher_buf_size *= 1024; /* kilobytes */
                 break;
             case WORKER_LOGBUF_SIZE:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing worker_logbuf_size argument\n");
-                    return 1;
+                    goto error;
                 }
                 if (!safe_strtoul(subopts_value, &settings.logger_buf_size)) {
                     fprintf(stderr, "could not parse argument to worker_logbuf_size\n");
-                    return 1;
+                    goto error;
                 }
                 settings.logger_buf_size *= 1024; /* kilobytes */
             case SLAB_SIZES:
@@ -5431,10 +5387,21 @@ int main (int argc, char **argv) {
             case SLAB_CHUNK_MAX:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing slab_chunk_max argument\n");
+                    goto error;
                 }
                 if (!safe_strtol(subopts_value, &settings.slab_chunk_size_max)) {
                     fprintf(stderr, "could not parse argument to slab_chunk_max\n");
+                    goto error;
                 }
+                if (settings.slab_chunk_size_max <= 0) {
+                    fprintf(stderr, "slab_chunk_max must be >= 0\n");
+                    goto error;
+                }
+                if (settings.slab_chunk_size_max > (1 << 10)) {
+                    fprintf(stderr, "slab_chunk_max must be specified in kilobytes.\n");
+                    goto error;
+                }
+                settings.slab_chunk_size_max *= (1 << 10);
                 slab_chunk_size_changed = true;
                 break;
             case TRACK_SIZES:
@@ -5468,14 +5435,14 @@ int main (int argc, char **argv) {
             case SSL_CERT:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing ssl_chain_cert argument\n");
-                    return 1;
+                    goto error;
                 }
                 settings.ssl_chain_cert = strdup(subopts_value);
                 break;
             case SSL_KEY:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing ssl_key argument\n");
-                    return 1;
+                    goto error;
                 }
                 settings.ssl_key = strdup(subopts_value);
                 break;
@@ -5483,67 +5450,51 @@ int main (int argc, char **argv) {
             {
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing ssl_verify_mode argument\n");
-                    return 1;
+                    goto error;
                 }
                 int verify  = 0;
                 if (!safe_strtol(subopts_value, &verify)) {
                     fprintf(stderr, "could not parse argument to ssl_verify_mode\n");
-                    return 1;
+                    goto error;
                 }
-                switch(verify) {
-                    case 0:
-                        settings.ssl_verify_mode = SSL_VERIFY_NONE;
-                        break;
-                    case 1:
-                        settings.ssl_verify_mode = SSL_VERIFY_PEER;
-                        break;
-                    case 2:
-                        settings.ssl_verify_mode = SSL_VERIFY_PEER |
-                                                    SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
-                        break;
-                    case 3:
-                        settings.ssl_verify_mode = SSL_VERIFY_PEER |
-                                                    SSL_VERIFY_FAIL_IF_NO_PEER_CERT |
-                                                    SSL_VERIFY_CLIENT_ONCE;
-                        break;
-                    default:
-                        fprintf(stderr, "Invalid ssl_verify_mode. Use help to see valid options.\n");
-                        return 1;
+                if (!ssl_set_verify_mode(verify)) {
+                    fprintf(stderr, "Invalid ssl_verify_mode. Use help to see valid options.\n");
+                    goto error;
                 }
                 break;
             }
             case SSL_KEYFORM:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing ssl_keyformat argument\n");
-                    return 1;
+                    goto error;
                 }
                 if (!safe_strtol(subopts_value, &settings.ssl_keyformat)) {
                     fprintf(stderr, "could not parse argument to ssl_keyformat\n");
-                    return 1;
+                    goto error;
                 }
                 break;
             case SSL_CIPHERS:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing ssl_ciphers argument\n");
-                    return 1;
+                    goto error;
                 }
                 settings.ssl_ciphers = strdup(subopts_value);
                 break;
             case SSL_CA_CERT:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing ssl_ca_cert argument\n");
-                    return 1;
+                    goto error;
                 }
                 settings.ssl_ca_cert = strdup(subopts_value);
                 break;
             case SSL_WBUF_SIZE:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing ssl_wbuf_size argument\n");
-                    return 1;
+                    goto error;
                 }
                 if (!safe_strtoul(subopts_value, &settings.ssl_wbuf_size)) {
                     fprintf(stderr, "could not parse argument to ssl_wbuf_size\n");
-                    return 1;
+                    goto error;
                 }
                 settings.ssl_wbuf_size *= 1024; /* kilobytes */
                 break;
@@ -5557,30 +5508,15 @@ int main (int argc, char **argv) {
                 int min_version;
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing ssl_min_version argument\n");
-                    return 1;
+                    goto error;
                 }
                 if (!safe_strtol(subopts_value, &min_version)) {
                     fprintf(stderr, "could not parse argument to ssl_min_version\n");
-                    return 1;
+                    goto error;
                 }
-                switch (min_version) {
-                    case 0:
-                        settings.ssl_min_version = TLS1_VERSION;
-                        break;
-                    case 1:
-                        settings.ssl_min_version = TLS1_1_VERSION;
-                        break;
-                    case 2:
-                        settings.ssl_min_version = TLS1_2_VERSION;
-                        break;
-#if defined(TLS1_3_VERSION)
-                    case 3:
-                        settings.ssl_min_version = TLS1_3_VERSION;
-                        break;
-#endif
-                    default:
-                        fprintf(stderr, "Invalid ssl_min_version. Use help to see valid options.\n");
-                        return 1;
+                if (!ssl_set_min_version(min_version)) {
+                    fprintf(stderr, "Invalid ssl_min_version. Use help to see valid options.\n");
+                    goto error;
                 }
                 break;
             }
@@ -5613,11 +5549,11 @@ int main (int argc, char **argv) {
             case READ_BUF_MEM_LIMIT:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing read_buf_mem_limit argument\n");
-                    return 1;
+                    goto error;
                 }
                 if (!safe_strtoul(subopts_value, &settings.read_buf_mem_limit)) {
                     fprintf(stderr, "could not parse argument to read_buf_mem_limit\n");
-                    return 1;
+                    goto error;
                 }
                 settings.read_buf_mem_limit *= 1024 * 1024; /* megabytes */
                 break;
@@ -5625,19 +5561,25 @@ int main (int argc, char **argv) {
             case PROXY_CONFIG:
                 if (subopts_value == NULL) {
                     fprintf(stderr, "Missing proxy_config file argument\n");
-                    return 1;
+                    goto error;
                 }
                 if (protocol_specified) {
                     fprintf(stderr, "Cannot specify a protocol with proxy mode enabled\n");
-                    return 1;
+                    goto error;
                 }
                 settings.proxy_startfile = strdup(subopts_value);
                 settings.proxy_enabled = true;
                 settings.binding_protocol = proxy_prot;
                 protocol_specified = true;
                 break;
+            case PROXY_ARG:
+                settings.proxy_startarg = strdup(subopts_value);
+                break;
             case PROXY_URING:
                 settings.proxy_uring = true;
+                break;
+            case PROXY_MEMPROFILE:
+                settings.proxy_memprofile = true;
                 break;
 #endif
 #ifdef MEMCACHED_DEBUG
@@ -5654,11 +5596,11 @@ int main (int argc, char **argv) {
 #ifdef EXTSTORE
                 // TODO: differentiating response code.
                 if (storage_read_config(storage_cf, &subopts_temp)) {
-                    return 1;
+                    goto error;
                 }
 #else
                 printf("Illegal suboption \"%s\"\n", subopts_temp);
-                return 1;
+                goto error;
 #endif
             } // switch
             if (subopts_temp_o) {
@@ -5811,7 +5753,6 @@ int main (int argc, char **argv) {
     }
 
 
-#ifdef TLS
     /*
      * Setup SSL if enabled
      */
@@ -5820,13 +5761,9 @@ int main (int argc, char **argv) {
             fprintf(stderr, "ERROR: You cannot enable SSL without a TCP port.\n");
             exit(EX_USAGE);
         }
-        // openssl init methods.
-        SSL_load_error_strings();
-        SSLeay_add_ssl_algorithms();
         // Initiate the SSL context.
         ssl_init();
     }
-#endif
 
     if (maxcore != 0) {
         struct rlimit rlim_new;
@@ -5876,7 +5813,7 @@ int main (int argc, char **argv) {
     /* lose root privileges if we have them */
     if (getuid() == 0 || geteuid() == 0) {
         if (username == 0 || *username == '\0') {
-            fprintf(stderr, "can't run as root without the -u switch\n");
+            fprintf(stderr, "must add '-u root' to start as root\n");
             exit(EX_USAGE);
         }
         if ((pw = getpwnam(username)) == 0) {
@@ -5911,9 +5848,6 @@ int main (int argc, char **argv) {
     /* daemonize if requested */
     /* if we want to ensure our ability to dump core, don't chdir to / */
     if (do_daemonize) {
-        if (signal(SIGHUP, SIG_IGN) == SIG_ERR) {
-            perror("Failed to ignore SIGHUP");
-        }
         if (daemonize(maxcore, settings.verbose) == -1) {
             fprintf(stderr, "failed to daemon() in order to daemonize\n");
             exit(EXIT_FAILURE);
@@ -5980,6 +5914,7 @@ int main (int argc, char **argv) {
     /* initialize other stuff */
     stats_init();
     logger_init();
+    logger_create(); // main process logger
     conn_init();
     bool reuse_mem = false;
     void *mem_base = NULL;
@@ -6055,19 +5990,23 @@ int main (int argc, char **argv) {
     /* start up worker threads if MT mode */
 #ifdef PROXY
     if (settings.proxy_enabled) {
-        settings.proxy_ctx = proxy_init(settings.proxy_uring);
-        if (proxy_load_config(settings.proxy_ctx) != 0) {
-            exit(EXIT_FAILURE);
-        }
+        settings.proxy_ctx = proxy_init(settings.proxy_uring, settings.proxy_memprofile);
     }
 #endif
 #ifdef EXTSTORE
-    slabs_set_storage(storage);
     memcached_thread_init(settings.num_threads, storage);
     init_lru_crawler(storage);
 #else
     memcached_thread_init(settings.num_threads, NULL);
     init_lru_crawler(NULL);
+#endif
+
+#ifdef PROXY
+    if (settings.proxy_enabled) {
+        if (proxy_first_confload(settings.proxy_ctx) != 0) {
+            exit(EXIT_FAILURE);
+        }
+    }
 #endif
 
     if (start_assoc_maint && start_assoc_maintenance_thread() == -1) {
@@ -6096,9 +6035,11 @@ int main (int argc, char **argv) {
         return 1;
     }
 
-    if (settings.slab_reassign &&
-        start_slab_maintenance_thread() == -1) {
-        exit(EXIT_FAILURE);
+    if (settings.slab_reassign) {
+        settings.slab_rebal = start_slab_maintenance_thread(storage);
+        if (!settings.slab_rebal) {
+            exit(EXIT_FAILURE);
+        }
     }
 
     if (settings.idle_timeout && start_conn_timeout_thread() == -1) {
@@ -6146,6 +6087,10 @@ int main (int argc, char **argv) {
         if (portnumber_filename != NULL) {
             len = strlen(portnumber_filename)+4+1;
             temp_portnumber_filename = malloc(len);
+            if (temp_portnumber_filename == NULL) {
+                vperror("Failed to allocate memory for portnumber file");
+                exit(EX_OSERR);
+            }
             snprintf(temp_portnumber_filename,
                      len,
                      "%s.lck", portnumber_filename);
@@ -6165,6 +6110,7 @@ int main (int argc, char **argv) {
             } else {
                 vperror("failed to listen on one of interface(s) %s", settings.inter);
             }
+            free(temp_portnumber_filename);
             exit(EX_OSERR);
         }
 
@@ -6184,6 +6130,7 @@ int main (int argc, char **argv) {
             } else {
                 vperror("failed to listen on one of interface(s) %s", settings.inter);
             }
+            free(temp_portnumber_filename);
             exit(EX_OSERR);
         }
 
@@ -6262,4 +6209,9 @@ int main (int argc, char **argv) {
     free(meta);
 
     return retval;
+
+error:
+    if (subopts_orig)
+        free(subopts_orig);
+    return 1;
 }
