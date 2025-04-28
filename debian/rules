@@ -11,7 +11,7 @@ PKGBASE=debian/memcached/usr/share/memcached
 SCRIPTS=$(PKGBASE)/scripts
 
 override_dh_auto_configure:
-	dh_auto_configure -- --enable-sasl --enable-tls
+	dh_auto_configure -- --enable-sasl --enable-tls --enable-proxy
 
 override_dh_auto_install:
 	dh_auto_install
@@ -34,7 +34,10 @@ override_dh_auto_test:
 	# .git directory (eg. on salsa)
 	rm -f t/whitespace.t
 
-ifeq (,$(filter $(DEB_BUILD_ARCH),armel armhf mips64el))
+	# Don't run the tests for the (experimental) proxy feature just yet.
+	rm -f t/proxy*
+
+ifeq (,$(filter $(DEB_BUILD_ARCH),armel armhf mips64el riscv64))
 	# SSL tests have a race condition and may hang
 	dh_auto_test --max-parallel=1
 endif

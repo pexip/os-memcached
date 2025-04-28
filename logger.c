@@ -6,7 +6,6 @@
 #include <string.h>
 #include <errno.h>
 #include <poll.h>
-#include <ctype.h>
 #include <stdarg.h>
 
 #if defined(__sun)
@@ -137,6 +136,18 @@ static void _logger_log_item_store(logentry *e, const entry_details *d, const vo
     e->size = sizeof(struct logentry_item_store) + nkey;
 }
 
+static void _logger_log_item_deleted(logentry *e, const entry_details *d, const void *entry, va_list ap) {
+    item *it = (item *)entry;
+    int comm = va_arg(ap, int);
+    struct logentry_deletion *le = (struct logentry_deletion *) e->data;
+    le->nkey = it->nkey;
+    le->cmd = comm;
+    le->nbytes = it->nbytes;
+    le->clsid = ITEM_clsid(it);
+    memcpy(le->key, ITEM_key(it), it->nkey);
+    e->size = sizeof(struct logentry_deletion) + le->nkey;
+}
+
 static void _logger_log_conn_event(logentry *e, const entry_details *d, const void *entry, va_list ap) {
     struct sockaddr_in6 *addr = va_arg(ap, struct sockaddr_in6 *);
     socklen_t addrlen = va_arg(ap, socklen_t);
@@ -160,6 +171,7 @@ static void _logger_log_conn_event(logentry *e, const entry_details *d, const vo
 static int _logger_util_addr_endpoint(struct sockaddr_in6 *addr, char *rip,
         size_t riplen, unsigned short *rport) {
     memset(rip, 0, riplen);
+    *rport = 0;
 
     switch (addr->sin6_family) {
         case AF_INET:
@@ -177,7 +189,6 @@ static int _logger_util_addr_endpoint(struct sockaddr_in6 *addr, char *rip,
         case AF_UNSPEC:
         case AF_UNIX:
             strncpy(rip, "unix", strlen("unix") + 1);
-            *rport = 0;
             break;
 #endif // #ifndef DISABLE_UNIX_SOCKET
     }
@@ -206,9 +217,9 @@ static int _logger_parse_ise(logentry *e, char *scratch) {
     const char * const status_map[] = {
         "not_stored", "stored", "exists", "not_found", "too_large", "no_memory" };
     const char * const cmd_map[] = {
-        "null", "add", "set", "replace", "append", "prepend", "cas" };
+        "null", "add", "set", "replace", "append", "prepend", "cas", "append", "prepend" };
 
-    if (le->cmd <= 6)
+    if (le->cmd <= 8)
         cmd = cmd_map[le->cmd];
 
     uriencode(le->key, keybuf, le->nkey, KEY_MAX_URI_ENCODED_LENGTH);
@@ -251,6 +262,26 @@ static int _logger_parse_ee(logentry *e, char *scratch) {
     return total;
 }
 
+static int _logger_parse_ide(logentry *e, char *scratch) {
+    int total;
+    const char *cmd = "na";
+    const char * const cmd_map[] = {
+            "null", "delete", "md" };
+    char keybuf[KEY_MAX_URI_ENCODED_LENGTH];
+    struct logentry_deletion *le = (struct logentry_deletion *) e->data;
+    uriencode(le->key, keybuf, le->nkey, KEY_MAX_URI_ENCODED_LENGTH);
+
+    if (le->cmd <= 2)
+        cmd = cmd_map[le->cmd];
+
+    total = snprintf(scratch, LOGGER_PARSE_SCRATCH,
+                     "ts=%d.%d gid=%llu type=deleted key=%s cmd=%s clsid=%u size=%d\n",
+                     (int)e->tv.tv_sec, (int)e->tv.tv_usec, (unsigned long long) e->gid,
+                     keybuf, cmd, le->clsid,
+                     le->nbytes > 0 ? le->nbytes - 2 : 0); // CLRF
+    return total;
+}
+
 #ifdef EXTSTORE
 static int _logger_parse_extw(logentry *e, char *scratch) {
     int total;
@@ -269,7 +300,7 @@ static int _logger_parse_extw(logentry *e, char *scratch) {
 
 static int _logger_parse_cne(logentry *e, char *scratch) {
     int total;
-    unsigned short rport;
+    unsigned short rport = 0;
     char rip[64];
     struct logentry_conn_event *le = (struct logentry_conn_event *) e->data;
     const char * const transport_map[] = { "local", "tcp", "udp" };
@@ -286,7 +317,7 @@ static int _logger_parse_cne(logentry *e, char *scratch) {
 
 static int _logger_parse_cce(logentry *e, char *scratch) {
     int total;
-    unsigned short rport;
+    unsigned short rport = 0;
     char rip[64];
     struct logentry_conn_event *le = (struct logentry_conn_event *) e->data;
     const char * const transport_map[] = { "local", "tcp", "udp" };
@@ -315,6 +346,8 @@ static void _logger_log_proxy_req(logentry *e, const entry_details *d, const voi
     unsigned short type = va_arg(ap, int);
     unsigned short code = va_arg(ap, int);
     int status = va_arg(ap, int);
+    int flag = va_arg(ap, int);
+    int conn_fd = va_arg(ap, int);
     char *detail = va_arg(ap, char *);
     int dlen = va_arg(ap, int);
     char *be_name = va_arg(ap, char *);
@@ -324,6 +357,8 @@ static void _logger_log_proxy_req(logentry *e, const entry_details *d, const voi
     le->type = type;
     le->code = code;
     le->status = status;
+    le->flag = flag;
+    le->conn_fd = conn_fd;
     le->dlen = dlen;
     le->elapsed = elapsed;
     if (be_name && be_port) {
@@ -357,18 +392,107 @@ static void _logger_log_proxy_req(logentry *e, const entry_details *d, const voi
     e->size = sizeof(struct logentry_proxy_req) + reqlen + dlen + le->be_namelen + le->be_portlen;
 }
 
+// FIXME: if I ever get better discipline around headers we can include the
+// proxy header. Since proxy.h includes memcached.h we need to redefine things
+// here.
+#define RQUEUE_R_GOOD (1<<3)
+#define RQUEUE_R_OK (1<<4)
+#define RQUEUE_R_ANY (1<<5)
 static int _logger_parse_prx_req(logentry *e, char *scratch) {
     int total;
     struct logentry_proxy_req *le = (void *)e->data;
+    const char *rqu_res = "any";
+    if (le->flag == RQUEUE_R_GOOD) {
+        rqu_res = "good";
+    } else if (le->flag == RQUEUE_R_OK) {
+        rqu_res = "ok";
+    }
 
     total = snprintf(scratch, LOGGER_PARSE_SCRATCH,
-            "ts=%lld.%d gid=%llu type=proxy_req elapsed=%lu type=%d code=%d status=%d be=%.*s:%.*s detail=%.*s req=%.*s\n",
+            "ts=%lld.%d gid=%llu type=proxy_req elapsed=%lu type=%d code=%d status=%d res=%s cfd=%d be=%.*s:%.*s detail=%.*s req=%.*s\n",
             (long long int) e->tv.tv_sec, (int) e->tv.tv_usec, (unsigned long long) e->gid,
-            le->elapsed, le->type, le->code, le->status,
+            le->elapsed, le->type, le->code, le->status, rqu_res, le->conn_fd,
             (int)le->be_namelen, le->data+le->reqlen+le->dlen,
             (int)le->be_portlen, le->data+le->reqlen+le->dlen+le->be_namelen, // fml.
             (int)le->dlen, le->data+le->reqlen, (int)le->reqlen, le->data
             );
+    return total;
+}
+
+#define MAX_RBUF_READ 100
+static void _logger_log_proxy_errbe(logentry *e, const entry_details *d, const void *entry, va_list ap) {
+    char *errmsg = va_arg(ap, char *);
+    char *be_name = va_arg(ap, char *);
+    char *be_port = va_arg(ap, char *);
+    char *be_label = va_arg(ap, char *);
+    int be_depth = va_arg(ap, int);
+    char *be_rbuf = va_arg(ap, char *);
+    int be_rbuflen = va_arg(ap, int);
+    int be_retry = va_arg(ap, int);
+
+    struct logentry_proxy_errbe *le = (void *)e->data;
+    le->be_depth = be_depth;
+    le->retry = be_retry;
+    le->errlen = strlen(errmsg);
+    if (be_name && be_port) {
+        le->be_namelen = strlen(be_name);
+        le->be_portlen = strlen(be_port);
+    }
+
+    if (be_label) {
+        le->be_labellen = strlen(be_label);
+    }
+
+    le->be_rbuflen = be_rbuflen;
+    if (be_rbuflen > MAX_RBUF_READ) {
+        le->be_rbuflen = MAX_RBUF_READ;
+    }
+
+    char *data = le->data;
+    memcpy(data, errmsg, le->errlen);
+    data += le->errlen;
+    memcpy(data, be_name, le->be_namelen);
+    data += le->be_namelen;
+    memcpy(data, be_port, le->be_portlen);
+    data += le->be_portlen;
+    memcpy(data, be_label, le->be_labellen);
+    data += le->be_labellen;
+    memcpy(data, be_rbuf, le->be_rbuflen);
+    data += le->be_rbuflen;
+
+    e->size = sizeof(struct logentry_proxy_errbe) + (data - le->data);
+}
+
+static int _logger_parse_prx_errbe(logentry *e, char *scratch) {
+    int total;
+    char rbuf[MAX_RBUF_READ * 3]; // x 3 for worst case URI encoding.
+    struct logentry_proxy_errbe *le = (void *)e->data;
+    char *data = le->data;
+    char *errmsg = data;
+    data += le->errlen;
+    char *be_name = data;
+    data += le->be_namelen;
+    char *be_port = data;
+    data += le->be_portlen;
+    char *be_label = data;
+    data += le->be_labellen;
+    char *be_rbuf = data;
+
+    uriencode(be_rbuf, rbuf, le->be_rbuflen, MAX_RBUF_READ * 3);
+    if (le->retry) {
+        total = snprintf(scratch, LOGGER_PARSE_SCRATCH,
+                "ts=%lld.%d gid=%llu type=proxy_backend error=%.*s name=%.*s port=%.*s label=%.*s retry=%d\n",
+                (long long int)e->tv.tv_sec, (int)e->tv.tv_usec, (unsigned long long) e->gid,
+                (int)le->errlen, errmsg, (int)le->be_namelen, be_name,
+                (int)le->be_portlen, be_port, (int)le->be_labellen, be_label, le->retry);
+    } else {
+        total = snprintf(scratch, LOGGER_PARSE_SCRATCH,
+                "ts=%lld.%d gid=%llu type=proxy_backend error=%.*s name=%.*s port=%.*s label=%.*s depth=%d rbuf=%s\n",
+                (long long int)e->tv.tv_sec, (int)e->tv.tv_usec, (unsigned long long) e->gid,
+                (int)le->errlen, errmsg, (int)le->be_namelen, be_name,
+                (int)le->be_portlen, be_port, (int)le->be_labellen, be_label, le->be_depth, rbuf);
+    }
+
     return total;
 }
 #endif
@@ -383,10 +507,17 @@ static const entry_details default_entries[] = {
         "type=lru_crawler crawler=%d lru=%s low_mark=%llu next_reclaims=%llu since_run=%u next_run=%d elapsed=%u examined=%llu reclaimed=%llu"
     },
     [LOGGER_SLAB_MOVE] = {512, LOG_SYSEVENTS, _logger_log_text, _logger_parse_text,
-        "type=slab_move src=%d dst=%d"
+        "type=slab_move src=%d dst=%d state=%s"
     },
     [LOGGER_CONNECTION_NEW] = {512, LOG_CONNEVENTS, _logger_log_conn_event, _logger_parse_cne, NULL},
     [LOGGER_CONNECTION_CLOSE] = {512, LOG_CONNEVENTS, _logger_log_conn_event, _logger_parse_cce, NULL},
+    [LOGGER_CONNECTION_ERROR] = {512, LOG_CONNEVENTS, _logger_log_text, _logger_parse_text,
+        "type=connerr fd=%d msg=%s"
+    },
+    [LOGGER_CONNECTION_TLSERROR] = {512, LOG_CONNEVENTS, _logger_log_text, _logger_parse_text,
+        "type=conntlserr fd=%d msg=%s"
+    },
+    [LOGGER_DELETIONS] = {512, LOG_DELETIONS, _logger_log_item_deleted, _logger_parse_ide, NULL},
 #ifdef EXTSTORE
     [LOGGER_EXTSTORE_WRITE] = {512, LOG_EVICTIONS, _logger_log_ext_write, _logger_parse_extw, NULL},
     [LOGGER_COMPACT_START] = {512, LOG_SYSEVENTS, _logger_log_text, _logger_parse_text,
@@ -419,8 +550,8 @@ static const entry_details default_entries[] = {
     [LOGGER_PROXY_USER] = {512, LOG_PROXYUSER, _logger_log_text, _logger_parse_text,
         "type=proxy_user msg=%s"
     },
-    [LOGGER_PROXY_BE_ERROR] = {512, LOG_PROXYEVENTS, _logger_log_text, _logger_parse_text,
-        "type=proxy_backend error=%s name=%s port=%s"
+    [LOGGER_PROXY_BE_ERROR] = {512, LOG_PROXYEVENTS, _logger_log_proxy_errbe, _logger_parse_prx_errbe,
+        NULL
     },
 
 #endif
@@ -913,8 +1044,8 @@ enum logger_ret_type logger_log(logger *l, const enum log_entry_type event, cons
     /* Request a maximum length of data to write to */
     e = (logentry *) bipbuf_request(buf, (sizeof(logentry) + reqlen));
     if (e == NULL) {
-        pthread_mutex_unlock(&l->mutex);
         l->dropped++;
+        pthread_mutex_unlock(&l->mutex);
         return LOGGER_RET_NOSPACE;
     }
     e->event = event;

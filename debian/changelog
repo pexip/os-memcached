@@ -1,3 +1,153 @@
+memcached (1.6.38-1) unstable; urgency=medium
+
+  * New upstream release.
+      <https://github.com/memcached/memcached/wiki/ReleaseNotes1638>
+
+ -- Chris Lamb <lamby@debian.org>  Fri, 21 Mar 2025 09:37:27 +0000
+
+memcached (1.6.37-1) unstable; urgency=medium
+
+  * New upstream release.
+    <https://github.com/memcached/memcached/wiki/ReleaseNotes1637>
+
+ -- Chris Lamb <lamby@debian.org>  Fri, 28 Feb 2025 11:03:39 +0000
+
+memcached (1.6.36-1) unstable; urgency=medium
+
+  * New upstream release.
+
+ -- Chris Lamb <lamby@debian.org>  Fri, 07 Feb 2025 09:56:15 +0000
+
+memcached (1.6.34-1) unstable; urgency=medium
+
+  * New upstream release.
+    <https://github.com/memcached/memcached/wiki/ReleaseNotes1634>
+
+ -- Chris Lamb <lamby@debian.org>  Mon, 30 Dec 2024 12:07:37 +0000
+
+memcached (1.6.33-2) unstable; urgency=medium
+
+  * Add liburi-perl to Suggests. Thanks, Athos Ribeiro. (Closes: #1089655)
+
+ -- Chris Lamb <lamby@debian.org>  Wed, 11 Dec 2024 11:07:03 +0000
+
+memcached (1.6.33-1) unstable; urgency=medium
+
+  * New upstream release.
+    <https://github.com/memcached/memcached/wiki/ReleaseNotes1633>
+
+ -- Chris Lamb <lamby@debian.org>  Fri, 06 Dec 2024 10:48:13 +0000
+
+memcached (1.6.32-3) unstable; urgency=medium
+
+  * Don't run the tests for the (experimental) proxy feature just yet.
+    (Closes: #1088571)
+  * Correct a typo in the previous changelog entry.
+
+ -- Chris Lamb <lamby@debian.org>  Thu, 28 Nov 2024 13:07:11 +0000
+
+memcached (1.6.32-2) unstable; urgency=medium
+
+  * Enable the built-in proxy server support. For more information, see
+    <https://docs.memcached.org/features/proxy/>. Do note that this code is
+    still marked as "EXPERIMENTAL" in the codebase. (Closes: #1086113)
+
+ -- Chris Lamb <lamby@debian.org>  Mon, 28 Oct 2024 10:02:58 -0700
+
+memcached (1.6.32-1) unstable; urgency=medium
+
+  * New upstream release.
+
+ -- Chris Lamb <lamby@debian.org>  Fri, 25 Oct 2024 11:04:50 -0700
+
+memcached (1.6.31-1) unstable; urgency=medium
+
+  * New upstream release.
+  * Bump Standards-Version to 4.7.0.
+
+ -- Chris Lamb <lamby@debian.org>  Fri, 13 Sep 2024 08:43:09 +0100
+
+memcached (1.6.29-1) unstable; urgency=medium
+
+  * New upstream release.
+    <https://github.com/memcached/memcached/wiki/ReleaseNotes1629>
+
+ -- Chris Lamb <lamby@debian.org>  Mon, 01 Jul 2024 11:36:14 -0700
+
+memcached (1.6.28-1) unstable; urgency=medium
+
+  * New upstream release.
+
+ -- Chris Lamb <lamby@debian.org>  Tue, 04 Jun 2024 08:32:09 +0100
+
+memcached (1.6.27-1) unstable; urgency=medium
+
+  * New upstream release.
+
+ -- Chris Lamb <lamby@debian.org>  Sun, 12 May 2024 10:21:11 +0100
+
+memcached (1.6.26-1) unstable; urgency=medium
+
+  * New upstream release.
+
+ -- Chris Lamb <lamby@debian.org>  Sat, 30 Mar 2024 09:10:43 +0000
+
+memcached (1.6.25-1) unstable; urgency=medium
+
+  * New upstream release.
+
+ -- Chris Lamb <lamby@debian.org>  Sat, 23 Mar 2024 09:59:53 +0000
+
+memcached (1.6.24-1) unstable; urgency=medium
+
+  * New upstream release.
+  * Drop 0007-uninitialized-variables.patch; applied upstream.
+
+ -- Chris Lamb <lamby@debian.org>  Sun, 03 Mar 2024 15:54:51 +0000
+
+memcached (1.6.23-1) unstable; urgency=medium
+
+  * New upstream release.
+
+ -- Chris Lamb <lamby@debian.org>  Sat, 13 Jan 2024 10:00:17 +0000
+
+memcached (1.6.22-1) unstable; urgency=medium
+
+  * New upstream release.
+  * Refresh patches.
+
+ -- Chris Lamb <lamby@debian.org>  Sat, 21 Oct 2023 09:17:43 +0100
+
+memcached (1.6.21-3) unstable; urgency=medium
+
+  * Also remove 'core' file from tests.
+  * Don't run the tests on riscv64. Thanks, Bo YU <tsu.yubo@gmail.com>.
+    (Closes: #1053823)
+
+ -- Chris Lamb <lamby@debian.org>  Thu, 12 Oct 2023 08:44:42 +0100
+
+memcached (1.6.21-2) unstable; urgency=medium
+
+  * Do more cleanup in the clean target. (Closes: #1046084)
+
+ -- Chris Lamb <lamby@debian.org>  Tue, 22 Aug 2023 13:08:14 -0700
+
+memcached (1.6.21-1) unstable; urgency=medium
+
+  * New upstream release.
+  * Refresh patches.
+  * Bump Standards-Version to 4.6.2.
+
+ -- Chris Lamb <lamby@debian.org>  Sat, 24 Jun 2023 10:36:16 +0100
+
+memcached (1.6.19-1) unstable; urgency=medium
+
+  * New upstream release.
+    - Refresh patches.
+  * memcached.conf: Also listen on IPv6 by default.
+
+ -- Chris Lamb <lamby@debian.org>  Wed, 15 Mar 2023 09:33:00 +0000
+
 memcached (1.6.18-1+pexip24u6) pexip-bookworm; urgency=medium
 
   * New versioning scheme
