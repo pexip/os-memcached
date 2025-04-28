@@ -1,6 +1,6 @@
---- a/testapp.c
-+++ b/testapp.c
-@@ -2320,8 +2320,6 @@
+--- memcached.orig/testapp.c
++++ memcached/testapp.c
+@@ -2331,8 +2331,6 @@ int main(int argc, char **argv)
      int ii = 0, num_cases = 0;
  #ifdef TLS
      if (getenv("SSL_TEST") != NULL) {
@@ -9,15 +9,3 @@
          enable_ssl = true;
      }
  #endif
---- a/memcached.c
-+++ b/memcached.c
-@@ -5820,9 +5820,6 @@
-             fprintf(stderr, "ERROR: You cannot enable SSL without a TCP port.\n");
-             exit(EX_USAGE);
-         }
--        // openssl init methods.
--        SSL_load_error_strings();
--        SSLeay_add_ssl_algorithms();
-         // Initiate the SSL context.
-         ssl_init();
-     }
