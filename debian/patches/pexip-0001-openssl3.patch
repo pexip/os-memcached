@@ -1,3 +1,5 @@
+Index: memcached/testapp.c
+===================================================================
 --- memcached.orig/testapp.c
 +++ memcached/testapp.c
 @@ -2331,8 +2331,6 @@ int main(int argc, char **argv)
@@ -9,3 +11,16 @@
          enable_ssl = true;
      }
  #endif
+Index: memcached/tls.c
+===================================================================
+--- memcached.orig/tls.c
++++ memcached/tls.c
+@@ -128,7 +128,7 @@ const unsigned char *ssl_get_peer_cn(con
+     }
+ 
+     // can't use get0 to avoid getting a reference since that requires 3.0.0+
+-    X509 *cert = SSL_get_peer_certificate(c->ssl);
++    X509 *cert = SSL_get1_peer_certificate(c->ssl);
+     if (cert == NULL) {
+         return NULL;
+     }
