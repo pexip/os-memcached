@@ -1,3 +1,5 @@
+Do not run unit tests in TLS mode as we do not use it, we only ever run
+memcached on a UNIX socket.
 --- a/t/lib/MemcachedTest.pm
 +++ b/t/lib/MemcachedTest.pm
 @@ -234,6 +234,7 @@

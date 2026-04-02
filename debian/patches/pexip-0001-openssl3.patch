@@ -1,3 +1,4 @@
+Update to use only non-deprecated APIs in OpenSSL3.
 Index: memcached/testapp.c
 ===================================================================
 --- memcached.orig/testapp.c
