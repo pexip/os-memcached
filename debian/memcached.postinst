@@ -29,7 +29,8 @@ configure)
               --shell /bin/false \
               $USER  >/dev/null
     fi
-    if [ ! -e /etc/memcached.conf ]
+    # Always install the latest config file
+    if [ ! -e /etc/memcached.conf ] || true
         then
             mkdir -p /etc
             cp /usr/share/memcached/memcached.conf.default /etc/memcached.conf
